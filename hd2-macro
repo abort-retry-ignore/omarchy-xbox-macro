@@ -47,6 +47,7 @@ RUNDIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
 SOCKET = RUNDIR / f"{APP}.sock"
 SELF = Path(__file__).resolve()
 UDEV_RULE = Path("/etc/udev/rules.d/72-hd2-macro-hide.rules")
+UDEV_GRANT = Path("/etc/udev/rules.d/71-hd2-macro-keyboard.rules")
 
 
 # --------------------------------------------------------------------------
@@ -933,6 +934,54 @@ def cmd_devices(args):
     return 0
 
 
+GRANT_RULE = """# Installed by hd2-macro ({app} grant). Grants the active local session an
+# ACL on keyboard event devices so hd2-macro can read hotkeys. udev already
+# does exactly this for joysticks (70-uaccess.rules); this extends it to
+# keyboards, without putting the user in the `input` group -- the ACL only
+# applies to whoever is physically logged in at the seat, and disappears when
+# they log out. Remove with: {app} revoke
+SUBSYSTEM=="input", KERNEL=="event*", ENV{{ID_INPUT_KEYBOARD}}=="?*", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{{ID_INPUT_KEY}}=="?*", TAG+="uaccess"
+"""
+
+
+def _reload_udev():
+    subprocess.call(["sudo", "udevadm", "control", "--reload"])
+    subprocess.call(["sudo", "udevadm", "trigger", "--subsystem-match=input",
+                     "--action=change"])
+    subprocess.call(["sudo", "udevadm", "settle"])
+
+
+def cmd_grant(args):
+    text = GRANT_RULE.format(app=APP)
+    print(f"installing {UDEV_GRANT}:\n")
+    print(text)
+    rc = subprocess.run(["sudo", "tee", str(UDEV_GRANT)],
+                        input=text.encode(), stdout=subprocess.DEVNULL).returncode
+    if rc:
+        return rc
+    _reload_udev()
+    kbs = find_keyboards([], set())
+    if kbs:
+        print(f"readable now: {', '.join(d.name for d in kbs[:4])}")
+        for d in kbs:
+            d.close()
+        print(f"\nrestart the daemon to pick them up:  {APP} off && {APP} on")
+        return 0
+    print("no keyboards readable yet -- try `sudo usermod -aG input $USER` and re-login")
+    return 1
+
+
+def cmd_revoke(args):
+    if not UDEV_GRANT.exists():
+        print("nothing to revoke")
+        return 0
+    subprocess.call(["sudo", "rm", "-f", str(UDEV_GRANT)])
+    _reload_udev()
+    print(f"removed {UDEV_GRANT}")
+    return 0
+
+
 def cmd_hide(args):
     pads = [g for g in gamepads() if not g["virtual"]]
     if args.all:
@@ -956,12 +1005,11 @@ def cmd_hide(args):
     print(text)
     for g in targets:
         print(f"  hiding {g['name']} ({g['vendor']}:{g['product']})")
-    rc = subprocess.call(["sudo", "tee", str(UDEV_RULE)],
-                         input=text.encode(), stdout=subprocess.DEVNULL)
+    rc = subprocess.run(["sudo", "tee", str(UDEV_RULE)],
+                        input=text.encode(), stdout=subprocess.DEVNULL).returncode
     if rc:
         return rc
-    subprocess.call(["sudo", "udevadm", "control", "--reload"])
-    subprocess.call(["sudo", "udevadm", "trigger", "--subsystem-match=input"])
+    _reload_udev()
     print(f"\ndone. verify with `{APP} devices`; undo with `{APP} unhide`")
     return 0
 
@@ -971,8 +1019,7 @@ def cmd_unhide(args):
         print("nothing to undo")
         return 0
     subprocess.call(["sudo", "rm", "-f", str(UDEV_RULE)])
-    subprocess.call(["sudo", "udevadm", "control", "--reload"])
-    subprocess.call(["sudo", "udevadm", "trigger", "--subsystem-match=input"])
+    _reload_udev()
     print(f"removed {UDEV_RULE}")
     return 0
 
@@ -1034,8 +1081,7 @@ def cmd_doctor(args):
         if kb_keys:
             kbs = find_keyboards(cfg.get("keyboards", {}).get("match", []), set())
             check("keyboards readable", bool(kbs),
-                  ", ".join(d.name for d in kbs[:2]) if kbs else
-                  "-> sudo usermod -aG input $USER (re-login), or bind in Hyprland instead")
+                  ", ".join(d.name for d in kbs[:2]) if kbs else f"-> {APP} grant")
             for d in kbs:
                 d.close()
         else:
@@ -1161,6 +1207,8 @@ def main():
         ("keys", "press keys to learn their [hotkeys] names"),
         ("devices", "list gamepads and what the browser sees"),
         ("unhide", "remove the udev rule installed by `hide`"),
+        ("grant", "let this session read keyboards, for keyboard hotkeys"),
+        ("revoke", "remove the udev rule installed by `grant`"),
         ("doctor", "diagnose the setup"),
     ]:
         sub.add_parser(name, help=help_)
@@ -1177,7 +1225,8 @@ def main():
     if c == "daemon":
         Daemon(load_config()).serve()
         return 0
-    if c in ("install", "doctor", "list", "keys", "devices", "hide", "unhide"):
+    if c in ("install", "doctor", "list", "keys", "devices", "hide", "unhide",
+             "grant", "revoke"):
         return globals()[f"cmd_{c}"](args)
     if c == "on":
         return systemctl("start", f"{APP}.service")

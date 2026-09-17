@@ -92,8 +92,31 @@ unless you want keyboard hotkeys or `hide`. `hd2-macro doctor` confirms it all.
 git clone <this repo> ~/Work/omarchy-xbox-macro
 cd ~/Work/omarchy-xbox-macro
 ./hd2-macro install     # config + ~/.local/bin symlink + systemd user unit
+hd2-macro grant         # let this session read keyboards (for keyboard hotkeys)
+hd2-macro hide          # keep a real controller out of the browser's gamepad list
 hd2-macro on
 hd2-macro doctor
+```
+
+The two `sudo` steps are optional and independently reversible (`revoke` /
+`unhide`); skip `grant` if you only use `pad:` buttons, and `hide` if you have
+no real controller. A clean run ends with:
+
+```
+permissions
+  [ok] /dev/uinput writable
+  [ok] joydev module loaded
+config
+  [ok] hotkey names valid  13 bound
+  [ok] keyboards readable  Logitech G915 TKL ...
+gamepads
+       /dev/input/js0  physical hidden   Microsoft Xbox Series S|X Controller
+       /dev/input/js1  virtual  VISIBLE  Microsoft X-Box 360 pad
+  [ok] browser sees exactly one gamepad
+daemon
+  [ok] running
+
+all good
 ```
 
 `install` copies `config.example.toml` to `~/.config/hd2-macro/config.toml` and
@@ -179,17 +202,25 @@ binds `M` with SUPER held (`SUPER+SHIFT+M`, `SUPER+SHIFT+ALT+M`), and
 Chromium's `Alt+Shift+<letter>` accelerators cover I B A R T C P X Z W — not M
 (checked in `chrome/browser/ui/accelerator_table.cc`).
 
-**Keyboard hotkeys need the `input` group.** udev only grants `uaccess` ACLs on
-joysticks, not keyboards, so:
+**Keyboard hotkeys need read access to keyboards.** udev grants `uaccess` ACLs
+on joysticks but not keyboards, so one of:
 
 ```bash
-sudo usermod -aG input $USER    # then log out and back in
+hd2-macro grant                 # recommended: takes effect immediately
+sudo usermod -aG input $USER    # traditional: needs a full logout
 ```
 
-That lets any program running as you read all keyboard input — worth knowing
-before you enable it. Two alternatives that need no privileges: `pad:` buttons
-(routed through the passthrough grab you already have, and consumed rather than
-forwarded to the game), or Hyprland binds calling `hd2-macro run <name>`.
+`grant` installs a udev rule extending the same `uaccess` tagging udev already
+applies to joysticks. It's both more convenient and tighter than the group: the
+ACL is granted only to whoever is physically logged in at the seat and is
+released on logout, whereas `input` group membership applies to every session
+including SSH. Undo with `hd2-macro revoke`.
+
+Either way, any program running as you can then read all keyboard input — worth
+knowing before enabling it. Two alternatives that need no privileges at all:
+`pad:` buttons (routed through the passthrough grab you already have, and
+consumed rather than forwarded to the game), or Hyprland binds calling
+`hd2-macro run <name>`.
 
 ### Scoping hotkeys to the game
 
@@ -281,7 +312,8 @@ hd2-macro daemon                      # run in the foreground instead
 | real controller stops working | that's the grab — it's being forwarded; check `hd2-macro status` shows `passthrough=<name>` |
 | hotkeys do nothing | `hd2-macro status` — if `armed=False`, press `ALT+SHIFT+M` |
 | `/dev/uinput` not writable | you're on a remote or inactive session; `loginctl` seat must be active |
-| no keyboards listed by `doctor` | `sudo usermod -aG input $USER`, then log out and back in |
+| no keyboards listed by `doctor` | `hd2-macro grant` (or `sudo usermod -aG input $USER` + re-login) |
+| keyboard plugged in mid-session | give it a few seconds; the daemon rescans every 3s |
 | don't know a key's name | `hd2-macro keys` |
 | macros half-register | lower `timing.speed` to `0.7`, raise `press_ms` |
 
