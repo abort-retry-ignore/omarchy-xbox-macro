@@ -1,0 +1,976 @@
+#!/usr/bin/env python3
+"""
+hd2-macro - one virtual Xbox 360 pad, with macro sequences, for Xbox Cloud Gaming.
+
+Creates a uinput device byte-identical to a wired Xbox 360 controller
+(045e:028e) so Chromium maps it to the W3C "standard" gamepad layout, which is
+what xbox.com/play requires. Keyboard hotkeys fire configurable macro sequences
+(Helldivers 2 stratagem codes, etc) onto that pad.
+
+If you also play with a real controller, passthrough mode grabs it exclusively
+and merges its input into the virtual pad, so the browser only ever sees one
+gamepad.
+
+  hd2-macro install     config + systemd user unit + PATH symlink
+  hd2-macro on|off|toggle|status
+  hd2-macro run NAME    fire a macro via the running daemon
+  hd2-macro devices     list gamepads and what the browser would see
+  hd2-macro hide|unhide keep a physical pad out of the browser's gamepad list
+  hd2-macro doctor      check permissions, joydev nodes, config
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import os
+import re
+import selectors
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+from pathlib import Path
+
+try:
+    from evdev import AbsInfo, InputDevice, UInput, ecodes as e, list_devices
+except ImportError:
+    sys.exit("python-evdev missing:  sudo pacman -S python-evdev")
+
+APP = "hd2-macro"
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP / "config.toml"
+RUNDIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+SOCKET = RUNDIR / f"{APP}.sock"
+SELF = Path(__file__).resolve()
+UDEV_RULE = Path("/etc/udev/rules.d/72-hd2-macro-hide.rules")
+
+
+# --------------------------------------------------------------------------
+# control vocabulary
+# --------------------------------------------------------------------------
+
+BUTTONS = {
+    "A": e.BTN_A, "B": e.BTN_B, "X": e.BTN_X, "Y": e.BTN_Y,
+    "LB": e.BTN_TL, "RB": e.BTN_TR,
+    "BACK": e.BTN_SELECT, "START": e.BTN_START, "GUIDE": e.BTN_MODE,
+    "LS": e.BTN_THUMBL, "RS": e.BTN_THUMBR,
+}
+HAT = {"UP": (e.ABS_HAT0Y, -1), "DOWN": (e.ABS_HAT0Y, 1),
+       "LEFT": (e.ABS_HAT0X, -1), "RIGHT": (e.ABS_HAT0X, 1)}
+TRIGGERS = {"LT": e.ABS_Z, "RT": e.ABS_RZ}
+STICKS = {"L": (e.ABS_X, e.ABS_Y), "R": (e.ABS_RX, e.ABS_RY)}
+DIRS = {"U": "UP", "D": "DOWN", "L": "LEFT", "R": "RIGHT",
+        "\u2191": "UP", "\u2193": "DOWN", "\u2190": "LEFT", "\u2192": "RIGHT"}
+
+# The kernel xpad driver's capability set, in its order, so the joydev
+# axis/button numbering matches a real Xbox 360 pad exactly:
+#   axes    0 LX  1 LY  2 LT  3 RX  4 RY  5 RT  6 DpadX  7 DpadY
+#   buttons 0 A   1 B   2 X   3 Y   4 LB  5 RB  6 Back  7 Start  8 Guide  9 LS  10 RS
+_STICK = AbsInfo(value=0, min=-32768, max=32767, fuzz=16, flat=128, resolution=0)
+_TRIG = AbsInfo(value=0, min=0, max=255, fuzz=0, flat=0, resolution=0)
+_HAT = AbsInfo(value=0, min=-1, max=1, fuzz=0, flat=0, resolution=0)
+
+CAPS = {
+    e.EV_KEY: list(BUTTONS.values()),
+    e.EV_ABS: [(e.ABS_X, _STICK), (e.ABS_Y, _STICK), (e.ABS_Z, _TRIG),
+               (e.ABS_RX, _STICK), (e.ABS_RY, _STICK), (e.ABS_RZ, _TRIG),
+               (e.ABS_HAT0X, _HAT), (e.ABS_HAT0Y, _HAT)],
+}
+TARGET_ABS = dict(CAPS[e.EV_ABS])
+
+
+def js_node_for(evdev_path: str) -> str | None:
+    """/dev/input/event26 -> /dev/input/js1 (same underlying input device)."""
+    sysdir = Path("/sys/class/input") / Path(evdev_path).name / "device"
+    for child in sorted(sysdir.glob("js*")) if sysdir.exists() else []:
+        return f"/dev/input/{child.name}"
+    return None
+
+
+def device_name(js_path: str) -> str:
+    p = Path("/sys/class/input") / Path(js_path).name / "device" / "name"
+    return p.read_text().strip() if p.exists() else "?"
+
+
+# --------------------------------------------------------------------------
+# virtual pad
+# --------------------------------------------------------------------------
+
+class Pad:
+    """The virtual pad. Merges two input layers:
+
+    phys  - forwarded from a real controller (passthrough)
+    macro - asserted by a running macro; overrides phys while held
+
+    Releasing a macro control falls back to whatever the real pad is doing,
+    so a macro never eats a button you are physically holding.
+    """
+
+    def __init__(self, cfg):
+        p = cfg.get("pad", {})
+        self.ui = UInput(
+            CAPS,
+            name=p.get("name", "Microsoft X-Box 360 pad"),
+            vendor=p.get("vendor", 0x045E),
+            product=p.get("product", 0x028E),
+            version=p.get("version", 0x0114),
+            bustype=p.get("bustype", 3),
+        )
+        self.lock = threading.RLock()
+        self.phys: dict[tuple[int, int], int] = {}
+        self.macro: dict[tuple[int, int], int] = {}
+        self.sent: dict[tuple[int, int], int] = {}
+
+    @property
+    def path(self) -> str:
+        return self.ui.device.path
+
+    @property
+    def js(self) -> str | None:
+        return js_node_for(self.path)
+
+    # ---- emission -------------------------------------------------------
+    def _flush(self, keys):
+        changed = False
+        for k in keys:
+            value = self.macro.get(k, self.phys.get(k, 0))
+            if self.sent.get(k, 0) != value:
+                self.sent[k] = value
+                self.ui.write(k[0], k[1], value)
+                changed = True
+        if changed:
+            self.ui.syn()
+
+    def _keys_for(self, name: str) -> list[tuple[tuple[int, int], int]]:
+        """Resolve a control name to [(key, asserted_value), ...]."""
+        n = name.upper()
+        if n in BUTTONS:
+            return [((e.EV_KEY, BUTTONS[n]), 1)]
+        if n in HAT:
+            axis, val = HAT[n]
+            return [((e.EV_ABS, axis), val)]
+        if n in TRIGGERS:
+            return [((e.EV_ABS, TRIGGERS[n]), 255)]
+        raise KeyError(f"unknown control {name!r}")
+
+    # ---- macro layer ----------------------------------------------------
+    def set(self, name: str, on: bool):
+        with self.lock:
+            keys = self._keys_for(name)
+            for k, v in keys:
+                if on:
+                    self.macro[k] = v
+                else:
+                    self.macro.pop(k, None)
+            self._flush([k for k, _ in keys])
+
+    def axis(self, name: str, value: int):
+        with self.lock:
+            k = (e.EV_ABS, TRIGGERS[name.upper()])
+            self.macro[k] = max(0, min(255, int(value)))
+            self._flush([k])
+
+    def stick(self, which: str, x: float, y: float):
+        ax, ay = STICKS[which.upper()]
+        clamp = lambda v: max(-32768, min(32767, int(v * 32767)))
+        with self.lock:
+            self.macro[(e.EV_ABS, ax)] = clamp(x)
+            self.macro[(e.EV_ABS, ay)] = clamp(y)
+            self._flush([(e.EV_ABS, ax), (e.EV_ABS, ay)])
+
+    def clear_macro(self):
+        """Drop every macro assertion; real controller input keeps flowing."""
+        with self.lock:
+            keys = list(self.macro)
+            self.macro.clear()
+            self._flush(keys)
+
+    # ---- passthrough layer ----------------------------------------------
+    def feed(self, etype: int, code: int, value: int):
+        with self.lock:
+            k = (etype, code)
+            self.phys[k] = value
+            self._flush([k])
+
+    def close(self):
+        try:
+            with self.lock:
+                self.macro.clear()
+                self.phys.clear()
+                self._flush(list(self.sent))
+            self.ui.close()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# passthrough: grab a real controller, merge it into the virtual pad
+# --------------------------------------------------------------------------
+
+class Passthrough:
+    """EVIOCGRAB is device-wide in the kernel: while we hold the grab, the
+    source pad's own jsN node emits nothing, so the browser cannot see it."""
+
+    def __init__(self, pad: Pad, cfg, on_button=None, log=print):
+        self.pad = pad
+        self.cfg = cfg.get("passthrough", {})
+        self.hotkeys: dict[int, str] = {}
+        self.on_button = on_button
+        self.log = log
+        self.dev: InputDevice | None = None
+        self.scale: dict[int, tuple[float, int, int]] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.cfg.get("enabled", True))
+
+    def candidates(self) -> list[InputDevice]:
+        want = self.cfg.get("match", [])
+        out = []
+        for path in list_devices():
+            if path == self.pad.path:
+                continue
+            try:
+                dev = InputDevice(path)
+            except OSError:
+                continue
+            caps = dev.capabilities()
+            keys = set(caps.get(e.EV_KEY, []))
+            axes = {c for c, _ in caps.get(e.EV_ABS, [])}
+            is_pad = e.BTN_A in keys and {e.ABS_X, e.ABS_Y} <= axes
+            ident = f"{dev.info.vendor:04x}:{dev.info.product:04x}"
+            if is_pad and (not want or any(
+                    m.lower() in dev.name.lower() or m.lower() == ident for m in want)):
+                out.append(dev)
+            else:
+                dev.close()
+        return out
+
+    def attach(self) -> bool:
+        if self.dev or not self.enabled:
+            return False
+        for dev in self.candidates():
+            try:
+                dev.grab()
+            except OSError as exc:
+                self.log(f"cannot grab {dev.name}: {exc}")
+                dev.close()
+                continue
+            self.dev = dev
+            self.scale = {}
+            for code, ai in dev.capabilities().get(e.EV_ABS, []):
+                tgt = TARGET_ABS.get(code)
+                if not tgt:
+                    continue
+                span = (ai.max - ai.min) or 1
+                self.scale[code] = ((tgt.max - tgt.min) / span, ai.min, tgt.min)
+            self.log(f"passthrough: grabbed {dev.name} "
+                     f"({dev.info.vendor:04x}:{dev.info.product:04x}) -> virtual pad")
+            return True
+        return False
+
+    def detach(self):
+        if self.dev:
+            try:
+                self.dev.ungrab()
+            except Exception:
+                pass
+            self.dev.close()
+            self.log(f"passthrough: released {self.dev.name}")
+            self.dev = None
+
+    def pump(self, dev):
+        try:
+            for ev in dev.read():
+                if ev.type == e.EV_KEY:
+                    if ev.code in self.hotkeys:
+                        if ev.value == 1 and self.on_button:
+                            self.on_button(self.hotkeys[ev.code])
+                        continue  # consumed, never forwarded
+                    if ev.code in BUTTONS.values():
+                        self.pad.feed(e.EV_KEY, ev.code, 1 if ev.value else 0)
+                elif ev.type == e.EV_ABS and ev.code in self.scale:
+                    factor, src_min, tgt_min = self.scale[ev.code]
+                    self.pad.feed(e.EV_ABS, ev.code,
+                                  int(round((ev.value - src_min) * factor + tgt_min)))
+        except OSError as exc:
+            if exc.errno in (errno.ENODEV, errno.EBADF):
+                return False
+        return True
+
+
+# --------------------------------------------------------------------------
+# macro compilation / execution
+# --------------------------------------------------------------------------
+
+class Cancelled(Exception):
+    pass
+
+
+def parse_code(s: str) -> list[str]:
+    """'UDRLU' / 'up down right' / arrows -> ['UP','DOWN','RIGHT','LEFT','UP']"""
+    out = []
+    for tok in s.replace(",", " ").replace("-", " ").split():
+        t = tok.upper()
+        if t in HAT:
+            out.append(t)
+            continue
+        for ch in t:
+            if ch in DIRS:
+                out.append(DIRS[ch])
+            elif not ch.isspace():
+                raise ValueError(f"bad direction {ch!r} in {s!r}")
+    return out
+
+
+class Runner:
+    """Executes macro step lists on the pad, one at a time, cancellable."""
+
+    def __init__(self, pad: Pad, cfg: dict, log=print):
+        self.pad = pad
+        self.cfg = cfg
+        self.log = log
+        self.cancel = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.lock = threading.Lock()
+
+    @property
+    def speed(self) -> float:
+        return float(self.cfg.get("timing", {}).get("speed", 1.0)) or 1.0
+
+    def t(self, key: str, default: int) -> float:
+        return (self.cfg.get("timing", {}).get(key, default) / 1000.0) / self.speed
+
+    def ms(self, value: float) -> float:
+        return float(value) / 1000.0 / self.speed
+
+    def sleep(self, seconds: float):
+        end = time.monotonic() + seconds
+        while True:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return
+            if self.cancel.wait(min(remaining, 0.01)):
+                raise Cancelled()
+
+    @property
+    def busy(self) -> bool:
+        return bool(self.thread and self.thread.is_alive())
+
+    def fire(self, name: str):
+        steps = self.resolve(name)
+        with self.lock:
+            if self.busy:
+                self.cancel.set()
+                self.thread.join(timeout=1.0)
+            self.cancel = threading.Event()
+            self.thread = threading.Thread(target=self._run, args=(name, steps), daemon=True)
+            self.thread.start()
+
+    def stop(self):
+        self.cancel.set()
+        if self.thread:
+            self.thread.join(timeout=1.0)
+        self.pad.clear_macro()
+
+    def resolve(self, name: str) -> list[str]:
+        if ":" in name:
+            kind, _, rest = name.partition(":")
+        elif name in self.cfg.get("stratagems", {}):
+            kind, rest = "strat", name
+        else:
+            kind, rest = "macro", name
+        if kind in ("strat", "stratagem"):
+            return [f"strat {self.cfg.get('stratagems', {}).get(rest, rest)}"]
+        if kind == "macro":
+            m = self.cfg.get("macros", {}).get(rest)
+            if m is None:
+                raise KeyError(f"no macro or stratagem named {rest!r}")
+            return list(m["steps"]) if isinstance(m, dict) else list(m)
+        if kind in ("press", "tap"):
+            return [f"press {rest}"]
+        if kind == "code":
+            return [f"code {rest}"]
+        raise KeyError(f"unknown target {name!r}")
+
+    def _run(self, name, steps):
+        self.log(f"run {name}")
+        try:
+            for step in steps:
+                self._step(step)
+        except Cancelled:
+            self.log(f"cancel {name}")
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"error in {name}: {exc}")
+        finally:
+            self.pad.clear_macro()
+
+    def _step(self, step: str):
+        parts = str(step).split()
+        if not parts:
+            return
+        op, args = parts[0].lower(), parts[1:]
+
+        if op in ("press", "tap"):
+            self.pad.set(args[0], True)
+            self.sleep(self.ms(args[1]) if len(args) > 1 else self.t("press_ms", 80))
+            self.pad.set(args[0], False)
+            self.sleep(self.t("gap_ms", 60))
+        elif op in ("down", "hold"):
+            self.pad.set(args[0], True)
+        elif op in ("up", "release"):
+            self.pad.set(args[0], False)
+        elif op in ("wait", "sleep", "delay"):
+            self.sleep(self.ms(args[0]))
+        elif op == "code":
+            self._code(parse_code(" ".join(args)))
+        elif op in ("strat", "stratagem"):
+            self._stratagem(" ".join(args))
+        elif op == "axis":
+            self.pad.axis(args[0], int(args[1]))
+            if len(args) > 2:
+                self.sleep(self.ms(args[2]))
+                self.pad.axis(args[0], 0)
+        elif op == "stick":
+            self.pad.stick(args[0], float(args[1]), float(args[2]))
+            if len(args) > 3:
+                self.sleep(self.ms(args[3]))
+                self.pad.stick(args[0], 0, 0)
+        elif op == "repeat":
+            for _ in range(int(args[0])):
+                self._step(" ".join(args[1:]))
+        elif op == "neutral":
+            self.pad.clear_macro()
+        else:
+            raise ValueError(f"unknown step {step!r}")
+
+    def _code(self, dirs: list[str]):
+        press, gap = self.t("press_ms", 80), self.t("gap_ms", 60)
+        for d in dirs:
+            self.pad.set(d, True)
+            self.sleep(press)
+            self.pad.set(d, False)
+            self.sleep(gap)
+
+    def _stratagem(self, code: str):
+        s = self.cfg.get("stratagem", {})
+        hold = s.get("hold_button", "LB")
+        tap = s.get("hold_mode", "hold") == "tap"
+        dirs = parse_code(self.cfg.get("stratagems", {}).get(code, code))
+        self.pad.set(hold, True)
+        if tap:
+            self.sleep(self.t("press_ms", 80))
+            self.pad.set(hold, False)
+        try:
+            self.sleep(self.ms(s.get("pre_ms", 150)))
+            self._code(dirs)
+            self.sleep(self.ms(s.get("post_ms", 120)))
+        finally:
+            if not tap:
+                self.pad.set(hold, False)
+        if s.get("throw_button"):
+            self.sleep(self.ms(s.get("throw_delay_ms", 250)))
+            self._step(f"press {s['throw_button']} {s.get('throw_ms', 120)}")
+
+
+# --------------------------------------------------------------------------
+# daemon
+# --------------------------------------------------------------------------
+
+def notify(cfg, title, body=""):
+    if not cfg.get("notify", True) or not shutil.which("notify-send"):
+        return
+    subprocess.Popen(["notify-send", "-a", APP, "-t", "1500", title, body],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def keycode(name: str) -> int:
+    n = name.upper()
+    if not n.startswith("KEY_"):
+        n = "KEY_" + n
+    code = e.ecodes.get(n)
+    if code is None:
+        raise KeyError(f"unknown key {name!r} (evdev KEY_* name, e.g. F13, KP1)")
+    return code if isinstance(code, int) else code[0]
+
+
+def padcode(name: str) -> int:
+    n = name.upper()
+    if n in BUTTONS:
+        return BUTTONS[n]
+    for prefix in ("BTN_", "KEY_"):
+        code = e.ecodes.get(n if n.startswith(prefix) else prefix + n)
+        if isinstance(code, int):
+            return code
+        if isinstance(code, list):
+            return code[0]
+    raise KeyError(f"unknown pad button {name!r}")
+
+
+def find_keyboards(match: list[str], exclude: set[str]) -> list[InputDevice]:
+    out = []
+    for path in list_devices():
+        if path in exclude:
+            continue
+        try:
+            dev = InputDevice(path)
+        except OSError:
+            continue
+        keys = set(dev.capabilities().get(e.EV_KEY, []))
+        if not {e.KEY_A, e.KEY_ENTER, e.KEY_SPACE} <= keys:
+            dev.close()
+            continue
+        if match and not any(m.lower() in dev.name.lower() for m in match):
+            dev.close()
+            continue
+        out.append(dev)
+    return out
+
+
+class Daemon:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.armed = True
+        self.running = True
+        self.pad = Pad(cfg)
+        self.runner = Runner(self.pad, cfg, log=self.log)
+        self.through = Passthrough(self.pad, cfg, on_button=self.handle, log=self.log)
+        self.hotkeys = {}
+        for key, target in cfg.get("hotkeys", {}).items():
+            if key.lower().startswith("pad:"):
+                self.through.hotkeys[padcode(key[4:])] = target
+            else:
+                self.hotkeys[keycode(key)] = target
+        self.sel = selectors.DefaultSelector()
+        self.keyboards: dict[str, InputDevice] = {}
+        self.srv = None
+
+    def log(self, msg):
+        print(f"[{APP}] {msg}", flush=True)
+
+    # ---- wiring ---------------------------------------------------------
+    def rescan(self):
+        if self.hotkeys:
+            want = self.cfg.get("keyboards", {}).get("match", [])
+            for dev in find_keyboards(want, {self.pad.path} | set(self.keyboards)):
+                self.sel.register(dev, selectors.EVENT_READ, self._on_key)
+                self.keyboards[dev.path] = dev
+                self.log(f"keyboard: {dev.name}")
+        if self.through.enabled and not self.through.dev and self.through.attach():
+            self.sel.register(self.through.dev, selectors.EVENT_READ, self._on_pad)
+
+    def _on_key(self, dev):
+        try:
+            for ev in dev.read():
+                if ev.type == e.EV_KEY and ev.value == 1 and ev.code in self.hotkeys:
+                    self.handle(self.hotkeys[ev.code])
+        except OSError as exc:
+            if exc.errno in (errno.ENODEV, errno.EBADF):
+                self.log(f"keyboard gone: {dev.name}")
+                self.sel.unregister(dev)
+                self.keyboards.pop(dev.path, None)
+                dev.close()
+
+    def _on_pad(self, dev):
+        if not self.through.pump(dev):
+            self.log("passthrough: source disconnected")
+            self.sel.unregister(dev)
+            self.through.dev = None
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+    def _on_client(self, srv):
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return
+        with conn:
+            conn.settimeout(2)
+            try:
+                reply = self.command(conn.recv(4096).decode().strip())
+                conn.sendall((reply + "\n").encode())
+            except OSError:
+                pass
+
+    # ---- commands -------------------------------------------------------
+    def command(self, line: str) -> str:
+        cmd, _, arg = line.partition(" ")
+        cmd, arg = cmd.strip().lower(), arg.strip()
+        if cmd == "status":
+            src = self.through.dev.name if self.through.dev else "none"
+            return (f"ok running armed={self.armed} pad={self.pad.path} "
+                    f"js={self.pad.js} passthrough={src} busy={self.runner.busy}")
+        if cmd == "arm":
+            self.armed = True
+            return "ok armed"
+        if cmd == "disarm":
+            self.armed = False
+            self.runner.stop()
+            return "ok disarmed"
+        if cmd == "quit":
+            self.running = False
+            return "ok bye"
+        if cmd == "run":
+            return self.handle(arg, force=True)
+        if cmd in ("toggle", "panic", "wake"):
+            return self.handle(cmd)
+        return f"err unknown command {line!r}"
+
+    def handle(self, target: str, force=False) -> str:
+        if target == "toggle":
+            self.armed = not self.armed
+            if not self.armed:
+                self.runner.stop()
+            notify(self.cfg, f"{APP}: {'armed' if self.armed else 'disarmed'}")
+            self.log("armed" if self.armed else "disarmed")
+            return f"ok armed={self.armed}"
+        if target == "panic":
+            self.runner.stop()
+            return "ok neutral"
+        if target == "wake":
+            btn = self.cfg.get("pad", {}).get("wake_button", "LS")
+            self.pad.set(btn, True)
+            time.sleep(0.12)
+            self.pad.set(btn, False)
+            return "ok wake"
+        if not self.armed and not force:
+            return "err disarmed"
+        try:
+            self.runner.fire(target)
+        except KeyError as exc:
+            self.log(str(exc))
+            return f"err {exc}"
+        return f"ok {target}"
+
+    # ---- loop -----------------------------------------------------------
+    def serve(self):
+        SOCKET.unlink(missing_ok=True)
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(str(SOCKET))
+        self.srv.listen(8)
+        self.srv.setblocking(False)
+        os.chmod(SOCKET, 0o600)
+        self.sel.register(self.srv, selectors.EVENT_READ, self._on_client)
+        self.rescan()
+        self.log(f"pad {self.pad.path} ({self.pad.js})  "
+                 f"hotkeys={len(self.hotkeys) + len(self.through.hotkeys)}")
+        notify(self.cfg, f"{APP} on", "virtual Xbox 360 pad ready")
+        last = 0.0
+        try:
+            while self.running:
+                for key, _ in self.sel.select(timeout=1.0):
+                    key.data(key.fileobj)
+                if time.monotonic() - last > 3:
+                    self.rescan()
+                    last = time.monotonic()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.shutdown()
+
+    def shutdown(self):
+        self.runner.stop()
+        for dev in self.keyboards.values():
+            dev.close()
+        self.through.detach()
+        self.pad.close()
+        if self.srv:
+            self.srv.close()
+        SOCKET.unlink(missing_ok=True)
+        notify(self.cfg, f"{APP} off")
+        self.log("stopped")
+
+
+# --------------------------------------------------------------------------
+# client side
+# --------------------------------------------------------------------------
+
+def load_config(path: Path = CONFIG) -> dict:
+    if not path.exists():
+        sys.exit(f"no config at {path}\nrun:  {APP} install")
+    with path.open("rb") as fh:
+        return tomllib.load(fh)
+
+
+def talk(line: str, quiet=False) -> str | None:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(3)
+            s.connect(str(SOCKET))
+            s.sendall(line.encode())
+            return s.recv(4096).decode().strip()
+    except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError):
+        if not quiet:
+            print(f"{APP} is not running  ({APP} on)", file=sys.stderr)
+        return None
+
+
+def systemctl(*args) -> int:
+    return subprocess.call(["systemctl", "--user", *args])
+
+
+UNIT = """[Unit]
+Description=hd2-macro virtual gamepad daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart={exe} daemon
+Restart=on-failure
+RestartSec=2
+Nice=-5
+
+[Install]
+WantedBy=graphical-session.target
+"""
+
+RULE = """# Installed by hd2-macro ({app} hide). Hides these gamepads' joydev nodes
+# from browsers so Xbox Cloud Gaming only sees the virtual pad. The evdev node
+# stays accessible so hd2-macro can grab and forward the real controller.
+# Remove with: {app} unhide
+{lines}
+"""
+
+
+def gamepads() -> list[dict]:
+    """Every gamepad on the system, with what a browser could actually open."""
+    out = []
+    for path in sorted(Path("/dev/input").glob("js*"), key=lambda p: p.name):
+        sysdev = Path("/sys/class/input") / path.name / "device"
+        read = lambda f: (sysdev / f).read_text().strip() if (sysdev / f).exists() else "?"
+        ev = next((c.name for c in sorted(sysdev.glob("event*"))), None)
+        out.append({
+            "js": str(path),
+            "name": read("name"),
+            "vendor": read("id/vendor"),
+            "product": read("id/product"),
+            "event": f"/dev/input/{ev}" if ev else None,
+            "browser_visible": os.access(path, os.R_OK),
+            "virtual": "/devices/virtual/" in os.path.realpath(sysdev),
+        })
+    return out
+
+
+def cmd_devices(args):
+    pads = gamepads()
+    if not pads:
+        print("no gamepads present")
+        return 0
+    print(f"{'node':<16}{'vid:pid':<12}{'kind':<10}{'browser':<10}name")
+    for g in pads:
+        print(f"{g['js']:<16}{g['vendor']}:{g['product']:<7}"
+              f"{'virtual' if g['virtual'] else 'physical':<10}"
+              f"{'VISIBLE' if g['browser_visible'] else 'hidden':<10}{g['name']}")
+    visible = [g for g in pads if g["browser_visible"]]
+    print(f"\nthe browser would see {len(visible)} gamepad(s)")
+    if len(visible) > 1:
+        phys = [g for g in visible if not g["virtual"]]
+        if phys:
+            print("xCloud works best with exactly one. Either:")
+            print(f"  - enable [passthrough] (default) so {phys[0]['name']!r} is merged in, and")
+            print(f"  - run `{APP} hide` to keep its node out of the browser's list")
+    return 0
+
+
+def cmd_hide(args):
+    pads = [g for g in gamepads() if not g["virtual"]]
+    if args.all:
+        targets = pads
+    elif args.device:
+        targets = [g for g in pads
+                   if args.device.lower() in g["name"].lower()
+                   or args.device.lower() == f"{g['vendor']}:{g['product']}"]
+    else:
+        targets = pads
+    if not targets:
+        print("no physical gamepads matched")
+        return 1
+    lines = "\n".join(
+        f'SUBSYSTEM=="input", KERNEL=="js[0-9]*", ATTRS{{id/vendor}}=="{g["vendor"]}", '
+        f'ATTRS{{id/product}}=="{g["product"]}", TAG-="uaccess", '
+        f'MODE="0600", OWNER="root", GROUP="root"'
+        for g in targets)
+    text = RULE.format(app=APP, lines=lines)
+    print(f"installing {UDEV_RULE}:\n")
+    print(text)
+    for g in targets:
+        print(f"  hiding {g['name']} ({g['vendor']}:{g['product']})")
+    rc = subprocess.call(["sudo", "tee", str(UDEV_RULE)],
+                         input=text.encode(), stdout=subprocess.DEVNULL)
+    if rc:
+        return rc
+    subprocess.call(["sudo", "udevadm", "control", "--reload"])
+    subprocess.call(["sudo", "udevadm", "trigger", "--subsystem-match=input"])
+    print(f"\ndone. verify with `{APP} devices`; undo with `{APP} unhide`")
+    return 0
+
+
+def cmd_unhide(args):
+    if not UDEV_RULE.exists():
+        print("nothing to undo")
+        return 0
+    subprocess.call(["sudo", "rm", "-f", str(UDEV_RULE)])
+    subprocess.call(["sudo", "udevadm", "control", "--reload"])
+    subprocess.call(["sudo", "udevadm", "trigger", "--subsystem-match=input"])
+    print(f"removed {UDEV_RULE}")
+    return 0
+
+
+def cmd_install(args):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    example = SELF.parent / "config.example.toml"
+    if CONFIG.exists() and not args.force:
+        print(f"keep    {CONFIG}  (--force to reset)")
+    elif example.exists():
+        shutil.copy(example, CONFIG)
+        print(f"wrote   {CONFIG}")
+    else:
+        sys.exit(f"missing {example}")
+
+    bindir = Path.home() / ".local/bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    link = bindir / APP
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(SELF)
+    print(f"linked  {link} -> {SELF}")
+
+    unitdir = Path.home() / ".config/systemd/user"
+    unitdir.mkdir(parents=True, exist_ok=True)
+    (unitdir / f"{APP}.service").write_text(UNIT.format(exe=link))
+    print(f"wrote   {unitdir / f'{APP}.service'}")
+    systemctl("daemon-reload")
+    print(f"\nnext:\n  {APP} on\n  {APP} doctor\n  systemctl --user enable {APP}  # at login")
+    return 0
+
+
+def cmd_doctor(args):
+    ok = True
+
+    def check(label, good, detail=""):
+        nonlocal ok
+        ok = ok and good
+        print(f"  [{'ok' if good else 'XX'}] {label}" + (f"  {detail}" if detail else ""))
+
+    print("permissions")
+    w = os.access("/dev/uinput", os.W_OK)
+    check("/dev/uinput writable", w, "" if w else "-> inactive session, or no uaccess ACL")
+    joydev = b"joydev" in subprocess.run(["lsmod"], capture_output=True).stdout
+    check("joydev module loaded", joydev, "" if joydev else "-> sudo modprobe joydev")
+
+    print("config")
+    check(str(CONFIG), CONFIG.exists())
+    cfg = {}
+    if CONFIG.exists():
+        cfg = load_config()
+        kb_keys = [k for k in cfg.get("hotkeys", {}) if not k.lower().startswith("pad:")]
+        try:
+            for k in cfg.get("hotkeys", {}):
+                padcode(k[4:]) if k.lower().startswith("pad:") else keycode(k)
+            check("hotkey names valid", True, f"{len(cfg.get('hotkeys', {}))} bound")
+        except KeyError as exc:
+            check("hotkey names valid", False, str(exc))
+        if kb_keys:
+            kbs = find_keyboards(cfg.get("keyboards", {}).get("match", []), set())
+            check("keyboards readable", bool(kbs),
+                  ", ".join(d.name for d in kbs[:2]) if kbs else
+                  "-> sudo usermod -aG input $USER (re-login), or bind in Hyprland instead")
+            for d in kbs:
+                d.close()
+        else:
+            print("  [--] no keyboard hotkeys configured (using Hyprland binds?)")
+
+    print("gamepads")
+    pads = gamepads()
+    for g in pads:
+        kind = "virtual" if g["virtual"] else "physical"
+        print(f"       {g['js']}  {kind:<9}{'VISIBLE' if g['browser_visible'] else 'hidden':<9}"
+              f"{g['name']}")
+    visible = [g for g in pads if g["browser_visible"]]
+    check("browser sees exactly one gamepad", len(visible) <= 1,
+          "none yet" if not visible else
+          ("" if len(visible) == 1 else f"sees {len(visible)} -> run `{APP} hide`"))
+    print(f"  [--] udev hide rule  "
+          f"{'installed' if UDEV_RULE.exists() else 'not installed (only needed with a real pad)'}")
+
+    print("daemon")
+    st = talk("status", quiet=True)
+    check("running", st is not None, st or f"-> {APP} on")
+    print("\n" + ("all good" if ok else "see the problems above"))
+    return 0 if ok else 1
+
+
+def cmd_list(args):
+    cfg = load_config()
+    print("hotkeys")
+    for k, v in cfg.get("hotkeys", {}).items():
+        print(f"  {k:<14} {v}")
+    print("\nstratagems")
+    for k, v in sorted(cfg.get("stratagems", {}).items()):
+        print(f"  {k:<28} {v}")
+    print("\nmacros")
+    for k in sorted(cfg.get("macros", {})):
+        print(f"  {k}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog=APP, description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name, help_ in [
+        ("daemon", "run the daemon in the foreground"),
+        ("on", "start the daemon service"),
+        ("off", "stop the daemon service"),
+        ("toggle", "start/stop the daemon service"),
+        ("status", "show daemon status"),
+        ("arm", "enable hotkeys"),
+        ("disarm", "ignore hotkeys, keep the pad connected"),
+        ("panic", "release every button immediately"),
+        ("wake", "nudge the pad so the browser exposes it to the page"),
+        ("list", "list hotkeys, stratagems and macros"),
+        ("devices", "list gamepads and what the browser sees"),
+        ("unhide", "remove the udev rule installed by `hide`"),
+        ("doctor", "diagnose the setup"),
+    ]:
+        sub.add_parser(name, help=help_)
+    r = sub.add_parser("run", help="fire a macro or stratagem now")
+    r.add_argument("name")
+    h = sub.add_parser("hide", help="keep a physical pad out of the browser's gamepad list")
+    h.add_argument("device", nargs="?", help="name fragment or vid:pid (default: all physical)")
+    h.add_argument("--all", action="store_true")
+    i = sub.add_parser("install", help="install config, symlink and systemd unit")
+    i.add_argument("--force", action="store_true", help="overwrite an existing config")
+
+    args = ap.parse_args()
+    c = args.cmd
+    if c == "daemon":
+        Daemon(load_config()).serve()
+        return 0
+    if c in ("install", "doctor", "list", "devices", "hide", "unhide"):
+        return globals()[f"cmd_{c}"](args)
+    if c == "on":
+        return systemctl("start", f"{APP}.service")
+    if c == "off":
+        return systemctl("stop", f"{APP}.service")
+    if c == "toggle":
+        active = subprocess.run(["systemctl", "--user", "is-active", "--quiet",
+                                 f"{APP}.service"]).returncode == 0
+        return systemctl("stop" if active else "start", f"{APP}.service")
+    if c == "status":
+        print(talk("status", quiet=True) or "stopped")
+        return 0
+    reply = talk(f"run {args.name}" if c == "run" else c)
+    if reply is None:
+        return 1
+    print(reply)
+    return 0 if reply.startswith("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

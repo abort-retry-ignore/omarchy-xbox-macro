@@ -1,0 +1,215 @@
+####################################################################
+# hd2-macro config            ~/.config/hd2-macro/config.toml
+# Edit, then:  systemctl --user restart hd2-macro
+####################################################################
+
+notify = true          # desktop notification on arm/disarm
+
+# ------------------------------------------------------------------
+# Virtual pad identity. Leave alone unless you know what you're doing:
+# Chromium picks the "standard" gamepad mapping from vendor/product,
+# and xbox.com/play refuses anything it can't map.
+# ------------------------------------------------------------------
+[pad]
+name    = "Microsoft X-Box 360 pad"
+vendor  = 0x045e
+product = 0x028e
+version = 0x0114
+wake_button = "LS"     # pressed by `hd2-macro wake` to make the browser notice the pad
+
+# ------------------------------------------------------------------
+# Timing. xCloud samples the pad ~60Hz and ships input over the
+# network, so presses shorter than ~60ms get dropped. If stratagems
+# misfire, raise press_ms/gap_ms first.
+# ------------------------------------------------------------------
+[timing]
+press_ms = 80          # how long each button is held
+gap_ms   = 60          # pause between presses
+speed    = 1.0         # global multiplier: 0.5 = half speed, 2.0 = twice as fast
+
+# ------------------------------------------------------------------
+# Helldivers 2 stratagem routine
+# ------------------------------------------------------------------
+[stratagem]
+hold_button = "LB"     # the stratagem button on an Xbox pad
+hold_mode   = "hold"   # "hold" = hold while entering  |  "tap" = press once to open
+pre_ms      = 150      # settle time after opening the stratagem menu
+post_ms     = 120      # pause after the last direction, before releasing
+# throw_button   = "RT"   # uncomment to auto-throw after entering the code
+# throw_delay_ms = 250
+# throw_ms       = 120
+
+# ------------------------------------------------------------------
+# Passthrough: keep the browser down to ONE gamepad.
+#
+# If you also play with a real controller, the browser would otherwise
+# see two pads (yours + this virtual one) and xCloud gets confused.
+# With passthrough on, hd2-macro takes an exclusive kernel grab of the
+# real pad and re-emits everything through the virtual one. A grab is
+# device-wide, so the real pad's own jsN node goes completely silent.
+#
+# The silent node still *exists*, so also run `hd2-macro hide` once to
+# strip its permissions and keep it out of the browser's list entirely.
+# Check the result any time with `hd2-macro devices`.
+# ------------------------------------------------------------------
+[passthrough]
+enabled = true
+match   = []           # [] = first gamepad found; or ["Xbox"] / ["045e:0b12"]
+
+# ------------------------------------------------------------------
+# Keyboards to watch (only used if [hotkeys] has keyboard entries)
+# ------------------------------------------------------------------
+[keyboards]
+match = []             # [] = every keyboard; or e.g. ["MX Keys", "AT Translated"]
+
+# ------------------------------------------------------------------
+# Hotkeys:  <key> = "<target>"
+#
+# Targets:
+#   "reinforce"        a [stratagems] entry
+#   "strat:UDRLU"      a literal code, no entry needed
+#   "macro:dive_prone" a [macros.*] block
+#   "press:A 300"      one button for 300ms
+#   "toggle"           arm/disarm without stopping the daemon
+#   "panic"            release everything
+#   "wake"             nudge the pad so the browser exposes it
+#
+# Keys:
+#   "F13"        an evdev KEY_* name; needs read access to keyboards,
+#                i.e. `sudo usermod -aG input $USER` + re-login.
+#   "pad:RECORD" a button on the passed-through controller. Needs no
+#                extra permissions and is consumed, never forwarded to
+#                the game. The Xbox Series X|S share button is free.
+#
+# WITHOUT the input group, bind keyboard keys in Hyprland instead --
+# it needs no permissions and swallows the key so it never leaks into
+# the game. In ~/.config/hypr/bindings.lua:
+#
+#   o.bind("SUPER + 1", "Reinforce", "hd2-macro run reinforce")
+#   o.bind("SUPER + 2", "500kg",     "hd2-macro run eagle_500kg")
+# ------------------------------------------------------------------
+[hotkeys]
+"pad:RECORD" = "reinforce"   # Xbox share button
+
+# Uncomment once you are in the `input` group. Prefer F13-F24: no
+# physical key sends them, so they can never collide with the game.
+# SCROLLLOCK = "toggle"
+# PAUSE      = "panic"
+# F13        = "reinforce"
+# F14        = "resupply"
+# F15        = "eagle_500kg"
+# F16        = "eagle_airstrike"
+# F17        = "orbital_precision_strike"
+# F18        = "orbital_laser"
+# F19        = "hellbomb"
+# F20        = "macro:dive_prone"
+
+# ------------------------------------------------------------------
+# Stratagem codes. U/D/L/R (or up/down/left/right, or arrows).
+# VERIFY these against your loadout - Arrowhead changes codes between
+# patches and you only need the ones you actually bring.
+# ------------------------------------------------------------------
+[stratagems]
+# mission
+reinforce                = "UDRLU"
+resupply                 = "DDUR"
+sos_beacon               = "UDRU"
+hellbomb                 = "DULDURDU"
+seaf_artillery           = "RUUD"
+upload_data              = "DRULUU"
+
+# eagle
+eagle_strafing_run       = "URR"
+eagle_airstrike          = "URDR"
+eagle_cluster_bomb       = "URDDR"
+eagle_napalm_airstrike   = "URDU"
+eagle_smoke_strike       = "URUD"
+eagle_110mm_rocket_pods  = "URUL"
+eagle_500kg              = "URDDD"
+eagle_rearm              = "UULUR"
+
+# orbital
+orbital_gatling_barrage      = "RDLUU"
+orbital_airburst_strike      = "RRR"
+orbital_120mm_he_barrage     = "RRDLRD"
+orbital_380mm_he_barrage     = "RDUULDD"
+orbital_walking_barrage      = "RDRDRD"
+orbital_laser                = "RDURD"
+orbital_railcannon_strike    = "RUDDR"
+orbital_precision_strike     = "RRU"
+orbital_gas_strike           = "RRDR"
+orbital_ems_strike           = "RRLD"
+orbital_smoke_strike         = "RRDU"
+
+# support weapons
+machine_gun              = "DLDUR"
+anti_materiel_rifle      = "DLRUD"
+stalwart                 = "DLDUUL"
+expendable_anti_tank     = "DDLUR"
+recoilless_rifle         = "DLRRL"
+flamethrower             = "DLUDU"
+autocannon               = "DLDUUR"
+heavy_machine_gun        = "DLUDD"
+railgun                  = "DRDULR"
+spear                    = "DDUDD"
+grenade_launcher         = "DLULD"
+laser_cannon             = "DLDUL"
+arc_thrower              = "DRDULL"
+quasar_cannon            = "DDULR"
+
+# backpacks
+jump_pack                = "DUUDU"
+supply_pack              = "DLDUUD"
+guard_dog_rover          = "DULURR"
+guard_dog                = "DULURD"
+shield_generator_pack    = "DULRLR"
+ballistic_shield         = "DLDDUL"
+
+# emplacements / sentries
+anti_personnel_minefield = "DLUR"
+incendiary_mines         = "DLLD"
+tesla_tower              = "DURULR"
+hmg_emplacement          = "DULRRL"
+shield_generator_relay   = "DDLRLR"
+machine_gun_sentry       = "DURRU"
+gatling_sentry           = "DURL"
+mortar_sentry            = "DURRD"
+autocannon_sentry        = "DURULU"
+rocket_sentry            = "DURRL"
+ems_mortar_sentry        = "DURDR"
+
+# ------------------------------------------------------------------
+# Free-form macros. Steps run top to bottom.
+#
+#   press <CTL> [ms]      tap a control (default timing.press_ms)
+#   down  <CTL>           hold it
+#   up    <CTL>           release it
+#   wait  <ms>
+#   code  <UDLR...>       d-pad sequence using timing.press_ms/gap_ms
+#   strat <UDLR|name>     full stratagem routine (hold + code + release)
+#   axis  <LT|RT> <0-255> [ms]
+#   stick <L|R> <x> <y> [ms]       x/y are -1.0 .. 1.0
+#   repeat <n> <step...>
+#   neutral               release everything
+#
+# Controls: A B X Y LB RB LT RT BACK START GUIDE LS RS UP DOWN LEFT RIGHT
+# ------------------------------------------------------------------
+[macros.dive_prone]
+steps = ["press B 120", "wait 150", "press B 120"]
+
+[macros.reload_and_stim]
+steps = ["press X 120", "wait 900", "press UP 100"]
+
+# Call in a defensive nest: MG sentry, then mines, then a shield relay.
+[macros.turtle_up]
+steps = [
+  "strat DURRU",     # machine gun sentry
+  "wait 600",
+  "strat DLUR",      # anti-personnel minefield
+  "wait 600",
+  "strat DDLRLR",    # shield generator relay
+]
+
+# Emote wheel spin, mostly to prove sticks work.
+[macros.spin]
+steps = ["stick L 1 0 200", "stick L 0 1 200", "stick L -1 0 200", "stick L 0 -1 200", "neutral"]
