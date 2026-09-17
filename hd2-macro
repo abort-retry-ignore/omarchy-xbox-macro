@@ -338,16 +338,23 @@ class Runner:
         self.cancel = threading.Event()
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
-        self._override: float | None = None
+        self._over: dict[str, float] = {}
 
     @property
     def speed(self) -> float:
-        if self._override:
-            return self._override
+        if "speed" in self._over:
+            return float(self._over["speed"]) or 1.0
         return float(self.cfg.get("timing", {}).get("speed", 1.0)) or 1.0
 
     def t(self, key: str, default: int) -> float:
-        return (self.cfg.get("timing", {}).get(key, default) / 1000.0) / self.speed
+        """A [timing] value, in seconds, honouring per-run overrides."""
+        raw = self._over.get(key, self.cfg.get("timing", {}).get(key, default))
+        return (float(raw) / 1000.0) / self.speed
+
+    def st(self, key: str, default: int) -> float:
+        """A [stratagem] value, in seconds, honouring per-run overrides."""
+        raw = self._over.get(key, self.cfg.get("stratagem", {}).get(key, default))
+        return (float(raw) / 1000.0) / self.speed
 
     def ms(self, value: float) -> float:
         return float(value) / 1000.0 / self.speed
@@ -365,14 +372,14 @@ class Runner:
     def busy(self) -> bool:
         return bool(self.thread and self.thread.is_alive())
 
-    def fire(self, name: str, speed: float | None = None):
+    def fire(self, name: str, over: dict | None = None):
         steps = self.resolve(name)
         with self.lock:
             if self.busy:
                 self.cancel.set()
                 self.thread.join(timeout=1.0)
             self.cancel = threading.Event()
-            self._override = speed
+            self._over = dict(over or {})
             self.thread = threading.Thread(target=self._run, args=(name, steps), daemon=True)
             self.thread.start()
 
@@ -403,7 +410,8 @@ class Runner:
         raise KeyError(f"unknown target {name!r}")
 
     def _run(self, name, steps):
-        self.log(f"run {name}" + (f" at {self._override}x" if self._override else ""))
+        extra = " ".join(f"{k}={v}" for k, v in self._over.items())
+        self.log(f"run {name}" + (f"  [{extra}]" if extra else ""))
         try:
             for step in steps:
                 self._step(step)
@@ -413,7 +421,7 @@ class Runner:
             self.log(f"error in {name}: {exc}")
         finally:
             self.pad.clear_macro()
-            self._override = None
+            self._over = {}
 
     def _step(self, step: str):
         parts = str(step).split()
@@ -454,17 +462,18 @@ class Runner:
         else:
             raise ValueError(f"unknown step {step!r}")
 
-    def _code(self, dirs: list[str]):
+    def _code(self, dirs: list[str], trailing_gap: bool = True):
         press, gap = self.t("press_ms", 80), self.t("gap_ms", 60)
-        for d in dirs:
+        for i, d in enumerate(dirs):
             self.pad.set(d, True)
             self.sleep(press)
             self.pad.set(d, False)
-            self.sleep(gap)
+            if trailing_gap or i < len(dirs) - 1:
+                self.sleep(gap)
 
     def _stratagem(self, code: str):
         s = self.cfg.get("stratagem", {})
-        hold = s.get("hold_button", "LB")
+        hold = self._over.get("hold_button", s.get("hold_button", "LB"))
         tap = s.get("hold_mode", "hold") == "tap"
         dirs = parse_code(self.cfg.get("stratagems", {}).get(code, code))
         self.pad.set(hold, True)
@@ -472,15 +481,21 @@ class Runner:
             self.sleep(self.t("press_ms", 80))
             self.pad.set(hold, False)
         try:
-            self.sleep(self.ms(s.get("pre_ms", 150)))
-            self._code(dirs)
-            self.sleep(self.ms(s.get("post_ms", 120)))
+            self.sleep(self.st("pre_ms", 250))
+            # No trailing gap: post_ms is measured from the final direction's
+            # release, so the hold button comes off promptly. HD2 closes the
+            # stratagem menu the moment a valid code lands, and a hold button
+            # still down after that re-opens it -- releasing it then with an
+            # empty code buffer stows the beacon you just drew.
+            self._code(dirs, trailing_gap=False)
+            self.sleep(self.st("post_ms", 80))
         finally:
             if not tap:
                 self.pad.set(hold, False)
-        if s.get("throw_button"):
-            self.sleep(self.ms(s.get("throw_delay_ms", 250)))
-            self._step(f"press {s['throw_button']} {s.get('throw_ms', 120)}")
+        throw = self._over.get("throw_button", s.get("throw_button"))
+        if throw:
+            self.sleep(self.st("throw_delay_ms", 300))
+            self._step(f"press {throw} {s.get('throw_ms', 120)}")
 
 
 # --------------------------------------------------------------------------
@@ -821,9 +836,13 @@ class Daemon:
             self.running = False
             return "ok bye"
         if cmd == "run":
-            name, _, speed = arg.partition("@")
-            return self.handle(name.strip(), force=True,
-                               speed=float(speed) if speed.strip() else None)
+            name, _, qs = arg.partition("?")
+            over = {}
+            for pair in qs.split("&") if qs else []:
+                k, _, v = pair.partition("=")
+                if k.strip():
+                    over[k.strip()] = float(v) if v.replace(".", "", 1).isdigit() else v
+            return self.handle(name.strip(), force=True, over=over)
         if cmd in ("toggle", "panic", "wake"):
             return self.handle(cmd)
         return f"err unknown command {line!r}"
@@ -835,7 +854,7 @@ class Daemon:
         else:
             self.notify("Macros disarmed", "Keyboard back to normal", kind="disarmed")
 
-    def handle(self, target: str, force=False, speed: float | None = None) -> str:
+    def handle(self, target: str, force=False, over: dict | None = None) -> str:
         if target == "toggle":
             self.armed = not self.armed
             if not self.armed:
@@ -858,7 +877,7 @@ class Daemon:
         if not force and not self.focus.allowed:
             return f"err window not focused ({self.focus.cls or 'none'})"
         try:
-            self.runner.fire(target, speed=speed)
+            self.runner.fire(target, over=over)
         except KeyError as exc:
             self.log(str(exc))
             return f"err {exc}"
@@ -1282,8 +1301,15 @@ def main():
     r = sub.add_parser("run", help="fire a macro or stratagem now")
     r.add_argument("name")
     r.add_argument("--speed", type=float, metavar="X",
-                   help="override timing.speed for this run only "
-                        "(0.5 = half speed, good for diagnosing misfires)")
+                   help="scale every duration for this run (0.5 = half speed)")
+    r.add_argument("--pre", type=float, metavar="MS",
+                   help="stratagem pre_ms: menu-open settle, before the first direction")
+    r.add_argument("--post", type=float, metavar="MS",
+                   help="stratagem post_ms: hold time after the last direction")
+    r.add_argument("--press", type=float, metavar="MS", help="press_ms for this run")
+    r.add_argument("--gap", type=float, metavar="MS", help="gap_ms for this run")
+    r.add_argument("--throw", metavar="BTN",
+                   help="throw the beacon with this button, e.g. RT ('' to disable)")
     h = sub.add_parser("hide", help="keep a physical pad out of the browser's gamepad list")
     h.add_argument("device", nargs="?", help="name fragment or vid:pid (default: all physical)")
     h.add_argument("--all", action="store_true")
@@ -1310,8 +1336,12 @@ def main():
         print(talk("status", quiet=True) or "stopped")
         return 0
     if c == "run":
-        target = f"run {args.name}" + (f"@{args.speed}" if args.speed else "")
-        reply = talk(target)
+        over = {k: v for k, v in (
+            ("speed", args.speed), ("pre_ms", args.pre), ("post_ms", args.post),
+            ("press_ms", args.press), ("gap_ms", args.gap),
+            ("throw_button", args.throw)) if v is not None}
+        qs = "&".join(f"{k}={v}" for k, v in over.items())
+        reply = talk(f"run {args.name}" + (f"?{qs}" if qs else ""))
     else:
         reply = talk(c)
     if reply is None:

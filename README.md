@@ -290,8 +290,10 @@ throw_delay_ms = 300
 throw_ms       = 120
 ```
 
-**The padding either side is not cosmetic.** In Helldivers 2 the D-pad is only
-the stratagem keypad *while the menu is open*. Outside it:
+**The padding either side is not cosmetic**, and the two ends fail differently.
+
+`pre_ms` guards the start. The D-pad is only the stratagem keypad *while the
+menu is open*; outside it HD2 binds:
 
 | D-pad | outside the stratagem menu |
 |---|---|
@@ -300,15 +302,22 @@ the stratagem keypad *while the menu is open*. Outside it:
 | Down | Use Backpack Function |
 | Left | Emote / spectate |
 
-So a direction that lands before the menu has opened, or after it has closed,
-comes out as a weapon action — which looks like *"the character switched back to
-rifle"* right after a stratagem. On xCloud there is a network round trip in the
-middle, so `pre_ms`/`post_ms` need real margin. Raise them before anything else.
+A direction landing before the menu has opened comes out as a weapon action.
 
-To diagnose without editing the config, run one at half speed and watch:
+`post_ms` guards the end, and wants to be **small**. HD2 closes the stratagem
+menu the moment a valid code lands and the diver draws the beacon. A hold
+button still down after that re-opens the menu, and releasing it with an empty
+code buffer stows the beacon you just drew — the diver *"selects the orb, then
+switches back to rifle"*. It is measured from the final direction's release,
+with no trailing gap, so the default 80ms puts LB up ~159ms after the
+completing press.
+
+Tune either end live, without editing the config or restarting:
 
 ```bash
-hd2-macro run reinforce --speed 0.5
+hd2-macro run reinforce --post 40      # release LB sooner
+hd2-macro run reinforce --pre 400      # give the menu longer to open
+hd2-macro run reinforce --speed 0.5    # stretch everything, to watch it happen
 ```
 
 If it works slowed down, it is timing — lower `timing.speed` or raise
@@ -371,7 +380,7 @@ hd2-macro daemon                      # run in the foreground instead
 | don't know a key's name | `hd2-macro keys` |
 | macros half-register | lower `timing.speed` to `0.7`, raise `press_ms` |
 | character reverts to rifle / throws a grenade or stim after a stratagem | a d-pad input leaked outside the menu \| macros half-register | lower `timing.speed` to `0.7`, raise `press_ms` |mdash; raise `pre_ms` and `post_ms` |
-| beacon drawn but never thrown | set `throw_button = "RT"` |
+| want it thrown automatically | set `throw_button = "RT"` (off by default, so the orb stays in hand) |
 
 No rumble: the virtual pad doesn't advertise force feedback, because
 forwarding `UI_FF_UPLOAD` requests back to the real pad isn't implemented.

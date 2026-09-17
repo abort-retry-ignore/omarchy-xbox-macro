@@ -52,24 +52,33 @@ speed    = 1.0         # global multiplier: 0.5 = half speed, 2.0 = twice as fas
 #
 # IMPORTANT: the D-pad is only the stratagem keypad *while the menu is
 # open*. Outside it, HD2 binds D-pad Up=Quick Stim, Right=Grenade,
-# Down=Backpack Function, Left=Emote. So any direction that lands
-# before the menu opens, or after it closes, comes out as a weapon
-# action -- which looks like "the character switched back to rifle".
-# If that happens, raise pre_ms and post_ms first.
+# Down=Backpack Function, Left=Emote. So a direction that lands before
+# the menu opens comes out as a weapon action -- that is what pre_ms
+# guards. post_ms guards the opposite end; see below.
 #
-# After a valid code the diver holds the beacon and still has to throw
-# it. Set throw_button to do that automatically.
+# Tune either one live, without editing this file or restarting:
+#     hd2-macro run reinforce --post 40
+#     hd2-macro run reinforce --pre 400 --speed 0.5
+#
+# After a valid code the diver draws the beacon and holds it. That is
+# usually where you want the macro to stop, so you can aim and throw it
+# yourself. throw_button is therefore OFF by default -- setting it to
+# "RT" (Fire) throws the beacon immediately, wherever you happen to be
+# pointing, and puts you straight back on your rifle.
 # ------------------------------------------------------------------
 [stratagem]
 hold_button = "LB"     # the stratagem button on an Xbox pad
 hold_mode   = "hold"   # "hold" = hold while entering  |  "tap" = press once to open
 pre_ms      = 250      # after opening the menu, before the first direction
-post_ms     = 200      # after the last direction, before releasing
+post_ms     = 80       # after the last direction releases, before LB releases.
+                       # Keep this SMALL. HD2 closes the stratagem menu the
+                       # moment a valid code lands; LB still held after that
+                       # re-opens it, and releasing it then with an empty code
+                       # buffer stows the beacon you just drew -- the diver
+                       # "selects the orb, then switches back to rifle".
 
-# Throw the beacon once the code is in. RT is Fire in HD2; without this
-# the diver just stands there holding it.
-throw_button   = "RT"
-throw_delay_ms = 300   # let the diver finish drawing the beacon
+throw_button   = ""    # "" = keep the beacon in hand.  "RT" = auto-throw
+throw_delay_ms = 300
 throw_ms       = 120
 
 # ------------------------------------------------------------------
