@@ -141,6 +141,30 @@ hd2-macro arm
 hd2-macro panic       # release every button right now
 ```
 
+Each of those raises an Omarchy notification, so you always know which mode
+you're in without checking a terminal:
+
+| | | |
+|---|---|---|
+| 󰖺 | **Macros armed** | 10 hotkeys live |
+| 󰖻 | **Macros disarmed** | Keyboard back to normal |
+| 󰜺 | **Panic** | All buttons released |
+
+They go through `omarchy notification send` (falling back to `notify-send`
+elsewhere) and reuse a single notification id, so toggling updates one toast
+instead of stacking a new one each time. Configure or silence them:
+
+```toml
+[notify]
+enabled    = true
+timeout_ms = 1800
+
+[notify.glyphs]             # any Nerd Font glyph
+armed    = "\U000F05BA"     # nf-md-microsoft_xbox_controller
+disarmed = "\U000F05BB"     # nf-md-microsoft_xbox_controller_off
+panic    = "\U000F073A"     # nf-md-cancel
+```
+
 ## Using it with xCloud
 
 1. `hd2-macro on`

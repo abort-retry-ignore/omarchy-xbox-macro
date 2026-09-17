@@ -3,7 +3,22 @@
 # Edit, then:  systemctl --user restart hd2-macro
 ####################################################################
 
-notify = true          # desktop notification on arm/disarm
+# ------------------------------------------------------------------
+# Desktop notifications on arm/disarm, start/stop and panic.
+# Uses `omarchy notification send` when available (falls back to
+# notify-send), and reuses one notification id so the toast updates
+# in place instead of stacking.
+# ------------------------------------------------------------------
+[notify]
+enabled    = true
+timeout_ms = 1800
+
+# Nerd Font glyphs shown on the toast. Defaults are the Material
+# Design xbox-controller pair; pick others at nerdfonts.com/cheat-sheet.
+[notify.glyphs]
+armed    = "\U000F05BA"   # nf-md-microsoft_xbox_controller
+disarmed = "\U000F05BB"   # nf-md-microsoft_xbox_controller_off
+panic    = "\U000F073A"   # nf-md-cancel
 
 # ------------------------------------------------------------------
 # Virtual pad identity. Leave alone unless you know what you're doing:

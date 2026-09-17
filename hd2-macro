@@ -558,13 +558,6 @@ class HyprFocus:
 # daemon
 # --------------------------------------------------------------------------
 
-def notify(cfg, title, body=""):
-    if not cfg.get("notify", True) or not shutil.which("notify-send"):
-        return
-    subprocess.Popen(["notify-send", "-a", APP, "-t", "1500", title, body],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
 MODIFIERS = {
     "SHIFT": (e.KEY_LEFTSHIFT, e.KEY_RIGHTSHIFT),
     "CTRL": (e.KEY_LEFTCTRL, e.KEY_RIGHTCTRL),
@@ -574,6 +567,59 @@ MODIFIERS = {
 MOD_ALIASES = {"CONTROL": "CTRL", "META": "SUPER", "WIN": "SUPER", "CMD": "SUPER",
                "MOD": "SUPER", "OPT": "ALT", "OPTION": "ALT", "ALTGR": "ALT"}
 MOD_BY_CODE = {code: name for name, codes in MODIFIERS.items() for code in codes}
+
+
+class Notifier:
+    """Omarchy desktop notifications, falling back to plain notify-send.
+
+    Reuses one notification id so arming/disarming updates a single toast
+    instead of stacking a new one every time.
+    """
+
+    GLYPHS = {"armed": "\U000f05ba",      # nf-md-microsoft_xbox_controller
+              "disarmed": "\U000f05bb",   # nf-md-microsoft_xbox_controller_off
+              "panic": "\U000f073a"}      # nf-md-cancel
+
+    def __init__(self, cfg, log=print):
+        section = cfg.get("notify", True)
+        if isinstance(section, dict):
+            self.enabled = section.get("enabled", True)
+            self.glyphs = {**self.GLYPHS, **section.get("glyphs", {})}
+            self.timeout = int(section.get("timeout_ms", 1800))
+        else:
+            self.enabled = bool(section)
+            self.glyphs = dict(self.GLYPHS)
+            self.timeout = 1800
+        self.log = log
+        self.omarchy = shutil.which("omarchy-notification-send") or shutil.which("omarchy")
+        self.fallback = shutil.which("notify-send")
+        self.last_id = 0
+
+    def __call__(self, headline, description="", kind="armed", urgency="low"):
+        if not self.enabled:
+            return
+        glyph = self.glyphs.get(kind, "")
+        try:
+            if self.omarchy:
+                cmd = [self.omarchy]
+                if cmd[0].endswith("/omarchy"):
+                    cmd += ["notification", "send"]
+                cmd += ["--app-name", APP, "-u", urgency, "-t", str(self.timeout), "-p"]
+                if glyph:
+                    cmd += ["-g", glyph]
+                if self.last_id:
+                    cmd += ["-r", str(self.last_id)]
+                cmd += [headline, description] if description else [headline]
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout
+                new_id = "".join(c for c in out.strip() if c.isdigit())
+                if new_id:
+                    self.last_id = int(new_id)
+            elif self.fallback:
+                subprocess.Popen([self.fallback, "-a", APP, "-t", str(self.timeout),
+                                  f"{glyph} {headline}".strip(), description],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as exc:  # noqa: BLE001 - a toast must never kill the daemon
+            self.log(f"notify failed: {exc}")
 
 
 def keycode(name: str) -> int:
@@ -651,6 +697,7 @@ class Daemon:
         self.armed = True
         self.running = True
         self.pad = Pad(cfg)
+        self.notify = Notifier(cfg, log=self.log)
         self.runner = Runner(self.pad, cfg, log=self.log)
         self.through = Passthrough(self.pad, cfg, on_button=self.handle, log=self.log)
         self.focus = HyprFocus(cfg, log=self.log)
@@ -758,10 +805,12 @@ class Daemon:
                     f"js={self.pad.js} passthrough={src} {gate}busy={self.runner.busy}")
         if cmd == "arm":
             self.armed = True
+            self.announce()
             return "ok armed"
         if cmd == "disarm":
             self.armed = False
             self.runner.stop()
+            self.announce()
             return "ok disarmed"
         if cmd == "quit":
             self.running = False
@@ -772,16 +821,24 @@ class Daemon:
             return self.handle(cmd)
         return f"err unknown command {line!r}"
 
+    def announce(self):
+        n = len([t for t in self.hotkeys.values() if t not in ("toggle", "panic", "wake")])
+        if self.armed:
+            self.notify("Macros armed", f"{n} hotkeys live", kind="armed")
+        else:
+            self.notify("Macros disarmed", "Keyboard back to normal", kind="disarmed")
+
     def handle(self, target: str, force=False) -> str:
         if target == "toggle":
             self.armed = not self.armed
             if not self.armed:
                 self.runner.stop()
-            notify(self.cfg, f"{APP}: {'armed' if self.armed else 'disarmed'}")
+            self.announce()
             self.log("armed" if self.armed else "disarmed")
             return f"ok armed={self.armed}"
         if target == "panic":
             self.runner.stop()
+            self.notify("Panic", "All buttons released", kind="panic", urgency="normal")
             return "ok neutral"
         if target == "wake":
             btn = self.cfg.get("pad", {}).get("wake_button", "LS")
@@ -815,7 +872,10 @@ class Daemon:
         self.rescan()
         self.log(f"pad {self.pad.path} ({self.pad.js})  "
                  f"hotkeys={len(self.hotkeys) + len(self.through.hotkeys)}")
-        notify(self.cfg, f"{APP} on", "virtual Xbox 360 pad ready")
+        src = self.through.dev.name if self.through.dev else None
+        self.notify("Macro engine on",
+                    f"Virtual pad ready" + (f" \u00b7 {src} merged in" if src else ""),
+                    kind="armed")
         last = 0.0
         try:
             while self.running:
@@ -839,7 +899,7 @@ class Daemon:
         if self.srv:
             self.srv.close()
         SOCKET.unlink(missing_ok=True)
-        notify(self.cfg, f"{APP} off")
+        self.notify("Macro engine off", "Controller released", kind="disarmed")
         self.log("stopped")
 
 
