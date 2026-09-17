@@ -274,15 +274,45 @@ duration at once.
 
 ### The stratagem routine
 
+```
+hold LB → wait pre_ms → tap the code → wait post_ms → release LB → throw
+```
+
 ```toml
 [stratagem]
 hold_button = "LB"      # stratagem button on an Xbox pad
 hold_mode   = "hold"    # "hold" while entering, or "tap" to open the menu
-pre_ms      = 150       # settle after opening
-post_ms     = 120       # pause before releasing
-# throw_button   = "RT" # uncomment to auto-throw once the code is in
-# throw_delay_ms = 250
+pre_ms      = 250       # after opening the menu, before the first direction
+post_ms     = 200       # after the last direction, before releasing
+
+throw_button   = "RT"   # HD2 Fire — without this the diver just holds the beacon
+throw_delay_ms = 300
+throw_ms       = 120
 ```
+
+**The padding either side is not cosmetic.** In Helldivers 2 the D-pad is only
+the stratagem keypad *while the menu is open*. Outside it:
+
+| D-pad | outside the stratagem menu |
+|---|---|
+| Up | Quick Stim |
+| Right | **Grenade** |
+| Down | Use Backpack Function |
+| Left | Emote / spectate |
+
+So a direction that lands before the menu has opened, or after it has closed,
+comes out as a weapon action — which looks like *"the character switched back to
+rifle"* right after a stratagem. On xCloud there is a network round trip in the
+middle, so `pre_ms`/`post_ms` need real margin. Raise them before anything else.
+
+To diagnose without editing the config, run one at half speed and watch:
+
+```bash
+hd2-macro run reinforce --speed 0.5
+```
+
+If it works slowed down, it is timing — lower `timing.speed` or raise
+`pre_ms`/`post_ms`. If it still misbehaves, the code itself is wrong.
 
 ### Macro DSL
 
@@ -340,6 +370,8 @@ hd2-macro daemon                      # run in the foreground instead
 | keyboard plugged in mid-session | give it a few seconds; the daemon rescans every 3s |
 | don't know a key's name | `hd2-macro keys` |
 | macros half-register | lower `timing.speed` to `0.7`, raise `press_ms` |
+| character reverts to rifle / throws a grenade or stim after a stratagem | a d-pad input leaked outside the menu \| macros half-register | lower `timing.speed` to `0.7`, raise `press_ms` |mdash; raise `pre_ms` and `post_ms` |
+| beacon drawn but never thrown | set `throw_button = "RT"` |
 
 No rumble: the virtual pad doesn't advertise force feedback, because
 forwarding `UI_FF_UPLOAD` requests back to the real pad isn't implemented.

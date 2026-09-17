@@ -36,6 +36,9 @@ wake_button = "LS"     # pressed by `hd2-macro wake` to make the browser notice 
 # Timing. xCloud samples the pad ~60Hz and ships input over the
 # network, so presses shorter than ~60ms get dropped. If stratagems
 # misfire, raise press_ms/gap_ms first.
+#
+# Test a change without editing this file:
+#     hd2-macro run reinforce --speed 0.5
 # ------------------------------------------------------------------
 [timing]
 press_ms = 80          # how long each button is held
@@ -44,15 +47,30 @@ speed    = 1.0         # global multiplier: 0.5 = half speed, 2.0 = twice as fas
 
 # ------------------------------------------------------------------
 # Helldivers 2 stratagem routine
+#
+#   hold LB -> wait pre_ms -> tap the code -> wait post_ms -> release LB
+#
+# IMPORTANT: the D-pad is only the stratagem keypad *while the menu is
+# open*. Outside it, HD2 binds D-pad Up=Quick Stim, Right=Grenade,
+# Down=Backpack Function, Left=Emote. So any direction that lands
+# before the menu opens, or after it closes, comes out as a weapon
+# action -- which looks like "the character switched back to rifle".
+# If that happens, raise pre_ms and post_ms first.
+#
+# After a valid code the diver holds the beacon and still has to throw
+# it. Set throw_button to do that automatically.
 # ------------------------------------------------------------------
 [stratagem]
 hold_button = "LB"     # the stratagem button on an Xbox pad
 hold_mode   = "hold"   # "hold" = hold while entering  |  "tap" = press once to open
-pre_ms      = 150      # settle time after opening the stratagem menu
-post_ms     = 120      # pause after the last direction, before releasing
-# throw_button   = "RT"   # uncomment to auto-throw after entering the code
-# throw_delay_ms = 250
-# throw_ms       = 120
+pre_ms      = 250      # after opening the menu, before the first direction
+post_ms     = 200      # after the last direction, before releasing
+
+# Throw the beacon once the code is in. RT is Fire in HD2; without this
+# the diver just stands there holding it.
+throw_button   = "RT"
+throw_delay_ms = 300   # let the diver finish drawing the beacon
+throw_ms       = 120
 
 # ------------------------------------------------------------------
 # Passthrough: keep the browser down to ONE gamepad.

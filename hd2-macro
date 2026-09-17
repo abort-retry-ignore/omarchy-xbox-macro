@@ -338,9 +338,12 @@ class Runner:
         self.cancel = threading.Event()
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
+        self._override: float | None = None
 
     @property
     def speed(self) -> float:
+        if self._override:
+            return self._override
         return float(self.cfg.get("timing", {}).get("speed", 1.0)) or 1.0
 
     def t(self, key: str, default: int) -> float:
@@ -362,13 +365,14 @@ class Runner:
     def busy(self) -> bool:
         return bool(self.thread and self.thread.is_alive())
 
-    def fire(self, name: str):
+    def fire(self, name: str, speed: float | None = None):
         steps = self.resolve(name)
         with self.lock:
             if self.busy:
                 self.cancel.set()
                 self.thread.join(timeout=1.0)
             self.cancel = threading.Event()
+            self._override = speed
             self.thread = threading.Thread(target=self._run, args=(name, steps), daemon=True)
             self.thread.start()
 
@@ -399,7 +403,7 @@ class Runner:
         raise KeyError(f"unknown target {name!r}")
 
     def _run(self, name, steps):
-        self.log(f"run {name}")
+        self.log(f"run {name}" + (f" at {self._override}x" if self._override else ""))
         try:
             for step in steps:
                 self._step(step)
@@ -409,6 +413,7 @@ class Runner:
             self.log(f"error in {name}: {exc}")
         finally:
             self.pad.clear_macro()
+            self._override = None
 
     def _step(self, step: str):
         parts = str(step).split()
@@ -816,7 +821,9 @@ class Daemon:
             self.running = False
             return "ok bye"
         if cmd == "run":
-            return self.handle(arg, force=True)
+            name, _, speed = arg.partition("@")
+            return self.handle(name.strip(), force=True,
+                               speed=float(speed) if speed.strip() else None)
         if cmd in ("toggle", "panic", "wake"):
             return self.handle(cmd)
         return f"err unknown command {line!r}"
@@ -828,7 +835,7 @@ class Daemon:
         else:
             self.notify("Macros disarmed", "Keyboard back to normal", kind="disarmed")
 
-    def handle(self, target: str, force=False) -> str:
+    def handle(self, target: str, force=False, speed: float | None = None) -> str:
         if target == "toggle":
             self.armed = not self.armed
             if not self.armed:
@@ -851,7 +858,7 @@ class Daemon:
         if not force and not self.focus.allowed:
             return f"err window not focused ({self.focus.cls or 'none'})"
         try:
-            self.runner.fire(target)
+            self.runner.fire(target, speed=speed)
         except KeyError as exc:
             self.log(str(exc))
             return f"err {exc}"
@@ -1274,6 +1281,9 @@ def main():
         sub.add_parser(name, help=help_)
     r = sub.add_parser("run", help="fire a macro or stratagem now")
     r.add_argument("name")
+    r.add_argument("--speed", type=float, metavar="X",
+                   help="override timing.speed for this run only "
+                        "(0.5 = half speed, good for diagnosing misfires)")
     h = sub.add_parser("hide", help="keep a physical pad out of the browser's gamepad list")
     h.add_argument("device", nargs="?", help="name fragment or vid:pid (default: all physical)")
     h.add_argument("--all", action="store_true")
@@ -1299,7 +1309,11 @@ def main():
     if c == "status":
         print(talk("status", quiet=True) or "stopped")
         return 0
-    reply = talk(f"run {args.name}" if c == "run" else c)
+    if c == "run":
+        target = f"run {args.name}" + (f"@{args.speed}" if args.speed else "")
+        reply = talk(target)
+    else:
+        reply = talk(c)
     if reply is None:
         return 1
     print(reply)
