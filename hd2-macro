@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import json
 import os
 import re
 import selectors
@@ -477,6 +478,82 @@ class Runner:
 
 
 # --------------------------------------------------------------------------
+# focus gate: only fire macros while the game window is focused
+# --------------------------------------------------------------------------
+
+class HyprFocus:
+    """Tracks the focused window via Hyprland's event socket, so ordinary keys
+    like 1 and 2 can be used as hotkeys without hijacking them system-wide."""
+
+    def __init__(self, cfg, log=print):
+        self.match = [m.lower() for m in cfg.get("focus", {}).get("only_when", [])]
+        self.log = log
+        self.sock = None
+        self.buf = b""
+        self.cls = ""
+        self.title = ""
+
+    @property
+    def gating(self) -> bool:
+        return bool(self.match)
+
+    def connect(self):
+        his = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+        if not self.gating or not his:
+            return None
+        path = RUNDIR / "hypr" / his / ".socket2.sock"
+        if not path.exists():
+            self.log(f"focus gate: no {path}, macros will fire regardless of focus")
+            self.match = []
+            return None
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(str(path))
+        s.setblocking(False)
+        self.sock = s
+        self.seed()
+        self.log(f"focus gate: only when window matches {self.match}")
+        return s
+
+    def seed(self):
+        try:
+            out = subprocess.run(["hyprctl", "activewindow", "-j"],
+                                 capture_output=True, text=True, timeout=2).stdout
+            d = json.loads(out)
+            self.cls, self.title = d.get("class", ""), d.get("title", "")
+        except Exception:
+            pass
+
+    def pump(self, sock) -> bool:
+        try:
+            data = sock.recv(65536)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        if not data:
+            return False
+        self.buf += data
+        while b"\n" in self.buf:
+            line, _, self.buf = self.buf.partition(b"\n")
+            ev, _, payload = line.decode("utf-8", "replace").partition(">>")
+            if ev == "activewindow":
+                self.cls, _, self.title = payload.partition(",")
+        return True
+
+    @property
+    def allowed(self) -> bool:
+        if not self.match:
+            return True
+        hay = f"{self.cls} {self.title}".lower()
+        return any(m in hay for m in self.match)
+
+    def close(self):
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+
+
+# --------------------------------------------------------------------------
 # daemon
 # --------------------------------------------------------------------------
 
@@ -487,6 +564,17 @@ def notify(cfg, title, body=""):
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+MODIFIERS = {
+    "SHIFT": (e.KEY_LEFTSHIFT, e.KEY_RIGHTSHIFT),
+    "CTRL": (e.KEY_LEFTCTRL, e.KEY_RIGHTCTRL),
+    "ALT": (e.KEY_LEFTALT, e.KEY_RIGHTALT),
+    "SUPER": (e.KEY_LEFTMETA, e.KEY_RIGHTMETA),
+}
+MOD_ALIASES = {"CONTROL": "CTRL", "META": "SUPER", "WIN": "SUPER", "CMD": "SUPER",
+               "MOD": "SUPER", "OPT": "ALT", "OPTION": "ALT", "ALTGR": "ALT"}
+MOD_BY_CODE = {code: name for name, codes in MODIFIERS.items() for code in codes}
+
+
 def keycode(name: str) -> int:
     n = name.upper()
     if not n.startswith("KEY_"):
@@ -495,6 +583,32 @@ def keycode(name: str) -> int:
     if code is None:
         raise KeyError(f"unknown key {name!r} (evdev KEY_* name, e.g. F13, KP1)")
     return code if isinstance(code, int) else code[0]
+
+
+def parse_hotkey(spec: str) -> tuple[int, frozenset[str]]:
+    """'ALT+SHIFT+M' -> (KEY_M, {'ALT','SHIFT'});  '1' -> (KEY_1, set())"""
+    parts = [p.strip().upper() for p in re.split(r"[+-](?!$)", spec.strip()) if p.strip()]
+    if not parts:
+        raise KeyError(f"empty hotkey {spec!r}")
+    mods, key = set(), None
+    for p in parts:
+        canon = MOD_ALIASES.get(p, p)
+        if canon in MODIFIERS:
+            mods.add(canon)
+        elif key is None:
+            key = p
+        else:
+            raise KeyError(f"hotkey {spec!r} has more than one non-modifier key")
+    if key is None:
+        raise KeyError(f"hotkey {spec!r} is only modifiers")
+    return keycode(key), frozenset(mods)
+
+
+def show_hotkey(code: int, mods: frozenset[str]) -> str:
+    name = e.KEY.get(code, code)
+    name = name[0] if isinstance(name, list) else str(name)
+    order = [m for m in ("CTRL", "ALT", "SHIFT", "SUPER") if m in mods]
+    return "+".join(order + [name.removeprefix("KEY_")])
 
 
 def padcode(name: str) -> int:
@@ -538,12 +652,14 @@ class Daemon:
         self.pad = Pad(cfg)
         self.runner = Runner(self.pad, cfg, log=self.log)
         self.through = Passthrough(self.pad, cfg, on_button=self.handle, log=self.log)
-        self.hotkeys = {}
+        self.focus = HyprFocus(cfg, log=self.log)
+        self.hotkeys: dict[tuple[int, frozenset[str]], str] = {}
+        self.mods: set[int] = set()
         for key, target in cfg.get("hotkeys", {}).items():
             if key.lower().startswith("pad:"):
                 self.through.hotkeys[padcode(key[4:])] = target
             else:
-                self.hotkeys[keycode(key)] = target
+                self.hotkeys[parse_hotkey(key)] = target
         self.sel = selectors.DefaultSelector()
         self.keyboards: dict[str, InputDevice] = {}
         self.srv = None
@@ -559,19 +675,45 @@ class Daemon:
                 self.sel.register(dev, selectors.EVENT_READ, self._on_key)
                 self.keyboards[dev.path] = dev
                 self.log(f"keyboard: {dev.name}")
+            self.resync_mods()
         if self.through.enabled and not self.through.dev and self.through.attach():
             self.sel.register(self.through.dev, selectors.EVENT_READ, self._on_pad)
+
+    def resync_mods(self):
+        """Rebuild modifier state from what is actually held down, so a missed
+        release event can't leave a phantom modifier wedging every hotkey."""
+        held = set()
+        for dev in list(self.keyboards.values()):
+            try:
+                held |= {c for c in dev.active_keys() if c in MOD_BY_CODE}
+            except OSError:
+                continue
+        if held != self.mods:
+            self.mods = held
 
     def _on_key(self, dev):
         try:
             for ev in dev.read():
-                if ev.type == e.EV_KEY and ev.value == 1 and ev.code in self.hotkeys:
-                    self.handle(self.hotkeys[ev.code])
+                if ev.type != e.EV_KEY:
+                    continue
+                if ev.code in MOD_BY_CODE:
+                    if ev.value:
+                        self.mods.add(ev.code)
+                    else:
+                        self.mods.discard(ev.code)
+                    continue
+                if ev.value != 1:  # keydown only, ignore autorepeat
+                    continue
+                active = frozenset(MOD_BY_CODE[c] for c in self.mods)
+                target = self.hotkeys.get((ev.code, active))
+                if target:
+                    self.handle(target)
         except OSError as exc:
             if exc.errno in (errno.ENODEV, errno.EBADF):
                 self.log(f"keyboard gone: {dev.name}")
                 self.sel.unregister(dev)
                 self.keyboards.pop(dev.path, None)
+                self.mods.clear()
                 dev.close()
 
     def _on_pad(self, dev):
@@ -583,6 +725,12 @@ class Daemon:
                 dev.close()
             except Exception:
                 pass
+
+    def _on_focus(self, sock):
+        if not self.focus.pump(sock):
+            self.log("focus gate: Hyprland socket closed")
+            self.sel.unregister(sock)
+            self.focus.close()
 
     def _on_client(self, srv):
         try:
@@ -603,8 +751,10 @@ class Daemon:
         cmd, arg = cmd.strip().lower(), arg.strip()
         if cmd == "status":
             src = self.through.dev.name if self.through.dev else "none"
+            gate = (f"focus={'PASS' if self.focus.allowed else 'BLOCKED'}"
+                    f"({self.focus.cls or '-'}) " if self.focus.gating else "")
             return (f"ok running armed={self.armed} pad={self.pad.path} "
-                    f"js={self.pad.js} passthrough={src} busy={self.runner.busy}")
+                    f"js={self.pad.js} passthrough={src} {gate}busy={self.runner.busy}")
         if cmd == "arm":
             self.armed = True
             return "ok armed"
@@ -640,6 +790,8 @@ class Daemon:
             return "ok wake"
         if not self.armed and not force:
             return "err disarmed"
+        if not force and not self.focus.allowed:
+            return f"err window not focused ({self.focus.cls or 'none'})"
         try:
             self.runner.fire(target)
         except KeyError as exc:
@@ -656,6 +808,9 @@ class Daemon:
         self.srv.setblocking(False)
         os.chmod(SOCKET, 0o600)
         self.sel.register(self.srv, selectors.EVENT_READ, self._on_client)
+        fsock = self.focus.connect()
+        if fsock:
+            self.sel.register(fsock, selectors.EVENT_READ, self._on_focus)
         self.rescan()
         self.log(f"pad {self.pad.path} ({self.pad.js})  "
                  f"hotkeys={len(self.hotkeys) + len(self.through.hotkeys)}")
@@ -678,6 +833,7 @@ class Daemon:
         for dev in self.keyboards.values():
             dev.close()
         self.through.detach()
+        self.focus.close()
         self.pad.close()
         if self.srv:
             self.srv.close()
@@ -871,7 +1027,7 @@ def cmd_doctor(args):
         kb_keys = [k for k in cfg.get("hotkeys", {}) if not k.lower().startswith("pad:")]
         try:
             for k in cfg.get("hotkeys", {}):
-                padcode(k[4:]) if k.lower().startswith("pad:") else keycode(k)
+                padcode(k[4:]) if k.lower().startswith("pad:") else parse_hotkey(k)
             check("hotkey names valid", True, f"{len(cfg.get('hotkeys', {}))} bound")
         except KeyError as exc:
             check("hotkey names valid", False, str(exc))
@@ -905,6 +1061,74 @@ def cmd_doctor(args):
     return 0 if ok else 1
 
 
+def cmd_keys(args):
+    """Live key identifier: press keys, get the name to put in [hotkeys]."""
+    devs = find_keyboards([], set())
+    pads = []
+    for path in list_devices():
+        try:
+            dev = InputDevice(path)
+        except OSError:
+            continue
+        caps = dev.capabilities()
+        if e.BTN_A in set(caps.get(e.EV_KEY, [])) and dev.path not in {d.path for d in devs}:
+            pads.append(dev)
+        else:
+            dev.close()
+    if not devs and not pads:
+        print("no readable input devices\n"
+              "  keyboards need:  sudo usermod -aG input $USER   (then log out and in)")
+        return 1
+    for d in devs:
+        print(f"watching keyboard  {d.name}")
+    for d in pads:
+        print(f"watching gamepad   {d.name}")
+    if talk("status", quiet=True) and pads:
+        print("note: the daemon holds a grab on the controller; stop it to see pad buttons")
+    print("\npress keys (ctrl-c to stop)\n")
+    sel = selectors.DefaultSelector()
+    for d in devs + pads:
+        sel.register(d, selectors.EVENT_READ, d in pads)
+    seen, mods = [], set()
+    try:
+        while True:
+            for key, _ in sel.select(timeout=1.0):
+                try:
+                    events = list(key.fileobj.read())
+                except OSError:
+                    continue
+                for ev in events:
+                    if ev.type != e.EV_KEY:
+                        continue
+                    if not key.data and ev.code in MOD_BY_CODE:
+                        mods.add(ev.code) if ev.value else mods.discard(ev.code)
+                        continue
+                    if ev.value != 1:
+                        continue
+                    if key.data:  # gamepad
+                        name = next((n for n, c in BUTTONS.items() if c == ev.code), None)
+                        raw = e.BTN.get(ev.code) or e.KEY.get(ev.code) or ev.code
+                        raw = raw[0] if isinstance(raw, list) else raw
+                        stem = str(raw).removeprefix("KEY_").removeprefix("BTN_")
+                        label = f'"pad:{name or stem}"'
+                    else:
+                        label = show_hotkey(ev.code, frozenset(MOD_BY_CODE[c] for c in mods))
+                        if not re.fullmatch(r"[A-Za-z0-9_]+", label):
+                            label = f'"{label}"'
+                    if label not in seen:
+                        seen.append(label)
+                        print(f"  {label:<20} # code {ev.code}")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for d in devs + pads:
+            d.close()
+    if seen:
+        print(f"\nput these in [hotkeys] in {CONFIG}, e.g.")
+        print(f'  {seen[0]} = "reinforce"')
+    return 0
+
+
 def cmd_list(args):
     cfg = load_config()
     print("hotkeys")
@@ -934,6 +1158,7 @@ def main():
         ("panic", "release every button immediately"),
         ("wake", "nudge the pad so the browser exposes it to the page"),
         ("list", "list hotkeys, stratagems and macros"),
+        ("keys", "press keys to learn their [hotkeys] names"),
         ("devices", "list gamepads and what the browser sees"),
         ("unhide", "remove the udev rule installed by `hide`"),
         ("doctor", "diagnose the setup"),
@@ -952,7 +1177,7 @@ def main():
     if c == "daemon":
         Daemon(load_config()).serve()
         return 0
-    if c in ("install", "doctor", "list", "devices", "hide", "unhide"):
+    if c in ("install", "doctor", "list", "keys", "devices", "hide", "unhide"):
         return globals()[f"cmd_{c}"](args)
     if c == "on":
         return systemctl("start", f"{APP}.service")

@@ -109,13 +109,13 @@ hd2-macro status
 systemctl --user enable hd2-macro     # start at login
 ```
 
-While it runs you can keep the pad connected but ignore hotkeys — handy when
-you tab out to type:
+While it runs, `ALT+SHIFT+M` (or `hd2-macro disarm`) suspends the hotkeys while
+keeping the pad connected — handy when you tab out to type:
 
 ```bash
-hd2-macro disarm      # or press ScrollLock (bound to "toggle")
+hd2-macro disarm      # ignore hotkeys
 hd2-macro arm
-hd2-macro panic       # release every button right now (bound to Pause)
+hd2-macro panic       # release every button right now
 ```
 
 ## Using it with xCloud
@@ -147,41 +147,59 @@ hd2-macro list        # review hotkeys / stratagems / macros
 
 ```toml
 [hotkeys]
-"pad:RECORD" = "reinforce"                # Xbox share button, no permissions needed
-F13          = "reinforce"                # a [stratagems] entry
-F14          = "strat:UDRLU"              # a literal code
-F15          = "macro:turtle_up"          # a [macros.*] block
-F16          = "press:A 300"              # hold A for 300ms
-SCROLLLOCK   = "toggle"                   # arm/disarm
-PAUSE        = "panic"
+1 = "reinforce"                 # a [stratagems] entry
+2 = "resupply"
+3 = "strat:URDDD"               # a literal code, no entry needed
+4 = "macro:turtle_up"           # a [macros.*] block
+5 = "press:A 300"               # hold A for 300ms
+
+"ALT+SHIFT+M" = "toggle"        # arm/disarm every other hotkey
+"ALT+SHIFT+P" = "panic"         # release every button
+"pad:RECORD"  = "panic"         # Xbox share button
 ```
 
-There are three ways to trigger a macro. Pick whichever suits you:
+The shipped config maps the whole digit row `1`–`0` to ten stratagems. Swap the
+names for your loadout.
 
-**Hyprland binds (recommended, zero setup).** Needs no permissions and Hyprland
-swallows the key, so it never leaks into the game. In
-`~/.config/hypr/bindings.lua`:
-
-```lua
-o.bind("SUPER + 1", "Reinforce", "hd2-macro run reinforce")
-o.bind("SUPER + 2", "500kg",     "hd2-macro run eagle_500kg")
-```
-
-**Controller buttons.** `"pad:RECORD"` binds the Xbox Series X|S share button,
-which xCloud doesn't use. These come through the passthrough grab you already
-have, so no extra permissions, and the button is *consumed* — never forwarded
-to the game. Any control name works: `pad:BACK`, `pad:GUIDE`, `pad:RS`, …
-
-**Keyboard hotkeys (needs the `input` group).** Reading keyboards directly
-requires `sudo usermod -aG input $USER` and a re-login, because udev only grants
-`uaccess` ACLs on joysticks, not keyboards. That group lets any program running
-as you read all keyboard input, so only do it if you want it. The daemon does
-*not* grab the keyboard, so these keys still reach Chromium — use `F13`–`F24`,
-which no physical key sends (remap spare mouse buttons to them). Key names are
-evdev `KEY_*` names without the prefix:
+**Keys** are evdev `KEY_*` names minus the prefix, optionally with `CTRL`,
+`ALT`, `SHIFT` or `SUPER` joined by `+`. Don't guess — press the key and let it
+tell you:
 
 ```bash
-python -c "import evdev; print(sorted(k for k in evdev.ecodes.ecodes if k.startswith('KEY_')))"
+hd2-macro keys      # prints the config-ready name of whatever you press
+```
+
+Matching is **exact**, so bindings can't shadow each other: `1` fires on a bare
+`1` only, never on `Shift+1` or `Ctrl+1`. The daemon doesn't grab the keyboard,
+so keys still reach the focused app and typing works normally.
+
+`ALT+SHIFT+M` toggles all the other hotkeys off and on without stopping the
+daemon or disconnecting the pad. It's deliberately conflict-free: Hyprland only
+binds `M` with SUPER held (`SUPER+SHIFT+M`, `SUPER+SHIFT+ALT+M`), and
+Chromium's `Alt+Shift+<letter>` accelerators cover I B A R T C P X Z W — not M
+(checked in `chrome/browser/ui/accelerator_table.cc`).
+
+**Keyboard hotkeys need the `input` group.** udev only grants `uaccess` ACLs on
+joysticks, not keyboards, so:
+
+```bash
+sudo usermod -aG input $USER    # then log out and back in
+```
+
+That lets any program running as you read all keyboard input — worth knowing
+before you enable it. Two alternatives that need no privileges: `pad:` buttons
+(routed through the passthrough grab you already have, and consumed rather than
+forwarded to the game), or Hyprland binds calling `hd2-macro run <name>`.
+
+### Scoping hotkeys to the game
+
+By default hotkeys fire whenever the daemon is running, in any window. To
+restrict them to the xCloud tab, match on the focused window's class or title
+(Hyprland only — the daemon watches `.socket2.sock`):
+
+```toml
+[focus]
+only_when = ["xbox.com"]
 ```
 
 ### Timing
@@ -261,10 +279,11 @@ hd2-macro daemon                      # run in the foreground instead
 | no gamepad on the page | focus the tab, `hd2-macro wake` |
 | xCloud sees two controllers | `hd2-macro devices`, then `hd2-macro hide` |
 | real controller stops working | that's the grab — it's being forwarded; check `hd2-macro status` shows `passthrough=<name>` |
+| hotkeys do nothing | `hd2-macro status` — if `armed=False`, press `ALT+SHIFT+M` |
 | `/dev/uinput` not writable | you're on a remote or inactive session; `loginctl` seat must be active |
-| no keyboards listed by `doctor` | `sudo usermod -aG input $USER`, then log out and back in — or use Hyprland binds / `pad:` buttons |
+| no keyboards listed by `doctor` | `sudo usermod -aG input $USER`, then log out and back in |
+| don't know a key's name | `hd2-macro keys` |
 | macros half-register | lower `timing.speed` to `0.7`, raise `press_ms` |
-| hotkey also types into the game | use an `F13`–`F24` key, or bind it in Hyprland instead |
 
 No rumble: the virtual pad doesn't advertise force feedback, because
 forwarding `UI_FF_UPLOAD` requests back to the real pad isn't implemented.
