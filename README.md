@@ -7,88 +7,21 @@ Virtual Xbox 360 controller + keyboard-triggered macro sequences for
 Press `1` → the daemon holds `LB`, taps `↑→↓↑` on the d-pad, releases.
 Napalm strike called, without memorising a single code.
 
-## Why a fake Xbox 360 pad?
-
-xbox.com/play only accepts a controller that Chromium maps to the W3C
-**"standard" gamepad mapping**. On Linux, Chromium selects that mapping from the
-device's USB vendor/product ID, reads state from the legacy `/dev/input/jsN`
-node, and ignores anything it doesn't recognise.
-
-So generic virtual-input tools don't work here:
-
-| tool | why not |
-|---|---|
-| `input-remapper` | emits a device named after itself → no standard mapping → xCloud ignores it |
-| `evsieve` | same, plus no timed macro sequences |
-| AntiMicroX / antimicro | maps gamepad → keyboard, the opposite direction |
-| `wtype` / `ydotool` | keyboard/mouse only; xCloud wants gamepad input |
-
-`hd2-macro` creates a uinput device with `045e:028e` and the exact capability
-set of the kernel `xpad` driver, in the same order — so the resulting `jsN`
-axis/button numbering is byte-identical to a real wired Xbox 360 controller.
-Chromium can't tell the difference.
-
-## Only one controller
-
-If you also play with a real pad, the browser would see two gamepads (yours and
-the virtual one) and xCloud gets confused about which to use. Two mechanisms
-keep it at exactly one:
-
-**1. Passthrough (on by default).** The daemon takes an exclusive `EVIOCGRAB`
-on your real controller and re-emits every button, stick and trigger through
-the virtual pad, rescaling axis ranges as needed (Xbox Series X|S triggers are
-0–1023, an Xbox 360's are 0–255). A grab is *device-wide* in the kernel — not
-just the evdev node — so the real pad's own `jsN` node goes completely silent:
-
-```
-ungrabbed -> joydev saw 2 events
-GRABBED   -> joydev saw 0 events
-ungrabbed -> joydev saw 2 events
-```
-
-You keep playing normally; macros are merged into the same stream. A macro
-overrides a control only while it holds it, then falls back to whatever you're
-physically pressing, so it can never eat a button out from under you.
-
-**2. `hd2-macro hide` (one-off, needs sudo).** The grabbed pad is silent but its
-`jsN` node still exists, and Chromium lists connected-but-idle gamepads. This
-installs `/etc/udev/rules.d/72-hd2-macro-hide.rules`, which drops the `uaccess`
-tag and sets `MODE="0600"` on that pad's **joydev node only** — Chromium can no
-longer open it, so it vanishes from the gamepad list, while the evdev node stays
-readable so hd2-macro can still grab and forward it.
-
-```bash
-hd2-macro devices     # what the browser can actually see
-hd2-macro hide        # hide every physical pad's js node
-hd2-macro hide Xbox   # or just one, by name fragment or vid:pid
-hd2-macro unhide      # undo
-```
-
-```
-node            vid:pid     kind      browser   name
-/dev/input/js0  045e:0b12   physical  hidden    Microsoft Xbox Series S|X Controller
-/dev/input/js1  045e:028e   virtual   VISIBLE   Microsoft X-Box 360 pad
-
-the browser would see 1 gamepad(s)
-```
-
-If you have no real controller, neither applies — set `passthrough.enabled =
-false` and skip `hide`.
-
-## Requirements
-
-- `python-evdev` (`sudo pacman -S python-evdev`)
-- `joydev` kernel module (loaded by default on Arch)
-- write access to `/dev/uinput`
-
-On Omarchy the last one already works: udev tags `uinput` with `uaccess`, so
-logind grants your active session an ACL. Same for joysticks, which is how the
-passthrough grab works unprivileged. No sudo, no group changes, no udev rule —
-unless you want keyboard hotkeys or `hide`. `hd2-macro doctor` confirms it all.
-
 ## Install
 
-On Arch/Omarchy:
+### Requirements
+
+- `python-evdev`
+- the `joydev` kernel module (loaded by default on Arch)
+- write access to `/dev/uinput`
+
+On Omarchy that last one already works: udev tags `uinput` with `uaccess`, so
+logind grants your active session an ACL. The same applies to joysticks, which
+is how the passthrough grab runs unprivileged. No sudo, no group changes and no
+udev rule are needed unless you want keyboard hotkeys or `hide`, both covered
+below. `hd2-macro doctor` checks all of it for you.
+
+### Arch / Omarchy
 
 ```bash
 sudo pacman -S --needed python-evdev
@@ -100,11 +33,13 @@ hd2-macro doctor
 
 `install` copies `config.example.toml` to `~/.config/hd2-macro/config.toml`,
 symlinks `hd2-macro` into `~/.local/bin`, and writes a systemd user unit. It
-never overwrites an existing config (pass `--force` if you want the defaults
-back). The script is a single file with no dependencies beyond `python-evdev`.
+never overwrites an existing config — pass `--force` if you want the defaults
+back. The program is a single file with no dependencies beyond `python-evdev`.
 
-Then, depending on what you need — both are optional, both need `sudo` once,
-and both are reversible:
+### Optional privileged steps
+
+Both need `sudo` once, both are reversible, and `doctor` tells you which you
+actually need:
 
 ```bash
 hd2-macro grant     # keyboard hotkeys: let this session read keyboards
@@ -112,8 +47,10 @@ hd2-macro hide      # real controller: keep it out of the browser's gamepad list
 ```
 
 Skip `grant` if you only trigger macros from `pad:` buttons or Hyprland binds.
-Skip `hide` if you have no physical controller. Undo either with
-`hd2-macro revoke` / `hd2-macro unhide`.
+Skip `hide` if you have no physical controller. Undo either with `hd2-macro
+revoke` / `hd2-macro unhide`.
+
+### Start it
 
 ```bash
 hd2-macro on
@@ -143,10 +80,10 @@ all good
 
 Nothing here is Omarchy-specific except the notification glyphs and the
 Hyprland focus gate, both optional. You need `python-evdev`, the `joydev`
-kernel module, and write access to `/dev/uinput` — on a systemd/logind desktop
-that last one is already granted to your active session by `uaccess`. If
-`hd2-macro doctor` says `/dev/uinput` is not writable, add yourself to a group
-with a udev rule, or run `sudo modprobe uinput` if the module is missing.
+kernel module, and write access to `/dev/uinput` — on any systemd/logind
+desktop that last one is already granted to your active session via `uaccess`.
+If `hd2-macro doctor` reports `/dev/uinput` is not writable, run `sudo modprobe
+uinput`, or add yourself to a group with a udev rule.
 
 ## Turning it on and off
 
@@ -379,6 +316,74 @@ Controls: `A B X Y LB RB LT RT BACK START GUIDE LS RS UP DOWN LEFT RIGHT`.
 Firing a macro cancels whichever one is still running, and every macro ends by
 returning the pad to neutral — a crashed or killed daemon can never leave a
 button stuck down.
+
+## Why a fake Xbox 360 pad?
+
+xbox.com/play only accepts a controller that Chromium maps to the W3C
+**"standard" gamepad mapping**. On Linux, Chromium selects that mapping from the
+device's USB vendor/product ID, reads state from the legacy `/dev/input/jsN`
+node, and ignores anything it doesn't recognise.
+
+So generic virtual-input tools don't work here:
+
+| tool | why not |
+|---|---|
+| `input-remapper` | emits a device named after itself → no standard mapping → xCloud ignores it |
+| `evsieve` | same, plus no timed macro sequences |
+| AntiMicroX / antimicro | maps gamepad → keyboard, the opposite direction |
+| `wtype` / `ydotool` | keyboard/mouse only; xCloud wants gamepad input |
+
+`hd2-macro` creates a uinput device with `045e:028e` and the exact capability
+set of the kernel `xpad` driver, in the same order — so the resulting `jsN`
+axis/button numbering is byte-identical to a real wired Xbox 360 controller.
+Chromium can't tell the difference.
+
+## Only one controller
+
+If you also play with a real pad, the browser would see two gamepads (yours and
+the virtual one) and xCloud gets confused about which to use. Two mechanisms
+keep it at exactly one:
+
+**1. Passthrough (on by default).** The daemon takes an exclusive `EVIOCGRAB`
+on your real controller and re-emits every button, stick and trigger through
+the virtual pad, rescaling axis ranges as needed (Xbox Series X|S triggers are
+0–1023, an Xbox 360's are 0–255). A grab is *device-wide* in the kernel — not
+just the evdev node — so the real pad's own `jsN` node goes completely silent:
+
+```
+ungrabbed -> joydev saw 2 events
+GRABBED   -> joydev saw 0 events
+ungrabbed -> joydev saw 2 events
+```
+
+You keep playing normally; macros are merged into the same stream. A macro
+overrides a control only while it holds it, then falls back to whatever you're
+physically pressing, so it can never eat a button out from under you.
+
+**2. `hd2-macro hide` (one-off, needs sudo).** The grabbed pad is silent but its
+`jsN` node still exists, and Chromium lists connected-but-idle gamepads. This
+installs `/etc/udev/rules.d/72-hd2-macro-hide.rules`, which drops the `uaccess`
+tag and sets `MODE="0600"` on that pad's **joydev node only** — Chromium can no
+longer open it, so it vanishes from the gamepad list, while the evdev node stays
+readable so hd2-macro can still grab and forward it.
+
+```bash
+hd2-macro devices     # what the browser can actually see
+hd2-macro hide        # hide every physical pad's js node
+hd2-macro hide Xbox   # or just one, by name fragment or vid:pid
+hd2-macro unhide      # undo
+```
+
+```
+node            vid:pid     kind      browser   name
+/dev/input/js0  045e:0b12   physical  hidden    Microsoft Xbox Series S|X Controller
+/dev/input/js1  045e:028e   virtual   VISIBLE   Microsoft X-Box 360 pad
+
+the browser would see 1 gamepad(s)
+```
+
+If you have no real controller, neither applies — set `passthrough.enabled =
+false` and skip `hide`.
 
 ## One keypress, one macro
 
