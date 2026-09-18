@@ -354,6 +354,34 @@ Firing a macro cancels whichever one is still running, and every macro ends by
 returning the pad to neutral — a crashed or killed daemon can never leave a
 button stuck down.
 
+## One keypress, one macro
+
+A single physical keypress can surface on **several** event nodes at once --
+one Logitech Unifying/Lightspeed receiver here exposes three that all carry the
+digit row:
+
+```
+!! same hardware usb-0000:0a:00.0-3:
+     /dev/input/event4   Logitech K540/K545
+     /dev/input/event9   Logitech K540/K545
+     /dev/input/event10  Logitech MX Master 3
+```
+
+Every duplicate used to re-trigger the macro, and each re-trigger *cancelled*
+the one in flight -- which releases the stratagem hold button and presses it
+again. HD2 reads that second press as a cancel and stows the beacon you just
+drew, so a stratagem would be selected and then instantly lost. Two defaults
+prevent it:
+
+```toml
+[timing]
+debounce_ms = 300      # ignore repeat triggers of the same macro
+on_busy     = "ignore" # never cancel and restart a macro mid-sequence
+```
+
+Set `on_busy = "restart"` only if you want a new macro to interrupt a running
+one, and accept that it will cancel a stratagem in progress.
+
 ## Stratagem codes
 
 `config.example.toml` ships the common Helldivers 2 codes. **Verify them

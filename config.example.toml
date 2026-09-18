@@ -99,57 +99,17 @@ enabled = true
 match   = []           # [] = first gamepad found; or ["Xbox"] / ["045e:0b12"]
 
 # ------------------------------------------------------------------
-# Keyboards to watch (only used if [hotkeys] has keyboard entries)
-# ------------------------------------------------------------------
-[keyboards]
-match = []             # [] = every keyboard; or e.g. ["MX Keys", "AT Translated"]
-
-# ------------------------------------------------------------------
-# Hotkeys:  <key> = "<target>"
-#
-# Targets:
-#   "reinforce"        a [stratagems] entry
-#   "strat:UDRLU"      a literal code, no entry needed
-#   "macro:dive_prone" a [macros.*] block
-#   "press:A 300"      one button for 300ms
-#   "toggle"           arm/disarm without stopping the daemon
-#   "panic"            release everything
-#   "wake"             nudge the pad so the browser exposes it
-#
-# Keys:
-#   "1", "F13"      an evdev KEY_* name, minus the prefix
-#   "ALT+SHIFT+M"   a chord; modifiers are CTRL, ALT, SHIFT, SUPER
-#   "pad:RECORD"    a button on the passed-through controller
-#
-# Matching is exact: `1` fires only on a bare 1, never on SHIFT+1, so
-# chords can never be shadowed by a plain binding.
-#
-# Keyboard keys need the `input` group:
-#     sudo usermod -aG input $USER      (then log out and back in)
-# `pad:` buttons need no extra permissions and are consumed, never
-# forwarded to the game -- the Xbox Series X|S share button is free.
-#
-# These fire whenever the daemon is running, in any window. Turn them
-# off with `hd2-macro off` (stops everything), ALT+SHIFT+M / `hd2-macro
-# disarm` (keeps the pad connected, ignores hotkeys), or scope them to
-# the game window with [focus] below.
-#
-# The daemon does not grab the keyboard, so these keys still reach the
-# focused app: the digits keep typing normally.
-# ------------------------------------------------------------------
-[hotkeys]
+# Keyboards to watch (only used if [hotkeys]
 # The digit row: one stratagem each. Swap the names for your loadout --
 # anything from [stratagems] below, or "strat:URDDD" for a raw code.
-1 = "reinforce"
-2 = "resupply"
-3 = "eagle_500kg"
-4 = "eagle_airstrike"
-5 = "orbital_precision_strike"
-6 = "orbital_laser"
-7 = "machine_gun_sentry"
-8 = "autocannon_sentry"
-9 = "hellbomb"
-0 = "sos_beacon"
+1 = "eagle_napalm_airstrike"
+2 = "gatling_sentry"
+3 = "machine_gun_sentry"
+4 = "autocannon_sentry"
+5 = "resupply"
+6 = "reinforce"
+7 = "sos_beacon"
+8 = "hellbomb"
 
 # Safety. ALT+SHIFT+M toggles every other hotkey on and off without
 # stopping the daemon, so the keyboard goes back to normal typing.
