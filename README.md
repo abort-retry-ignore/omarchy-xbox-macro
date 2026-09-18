@@ -9,68 +9,38 @@ Napalm strike called, without memorising a single code.
 
 ## Install
 
-### Requirements
-
-- `python-evdev`
-- the `joydev` kernel module (loaded by default on Arch)
-- write access to `/dev/uinput`
-
-On a desktop that already has Steam or `logitech-udev-rules` installed, the
-last one works out of the box — those packages ship a udev rule tagging
-`uinput` with `uaccess`, so logind grants your active session an ACL. **A clean
-machine has no such rule and `/dev/uinput` stays root-only**, which makes the
-daemon fail to start. `hd2-macro grant` installs the rule, and `hd2-macro
-doctor` tells you whether you need it.
-
-Joysticks are different: udev tags those with `uaccess` as standard, which is
-how the passthrough grab runs unprivileged everywhere.
-
-### Arch / Omarchy
+### Quick install
 
 ```bash
-sudo pacman -S --needed python-evdev
 git clone https://github.com/abort-retry-ignore/omarchy-xbox-macro.git
 cd omarchy-xbox-macro
-./hd2-macro install
-hd2-macro doctor
+./install.sh
 ```
 
-`install` copies `config.example.toml` to `~/.config/hd2-macro/config.toml`,
-symlinks `hd2-macro` into `~/.local/bin`, and writes a systemd user unit. It
-never overwrites an existing config — pass `--force` if you want the defaults
-back. The program is a single file with no dependencies beyond `python-evdev`.
-
-### Optional privileged steps
-
-Each needs `sudo` once, each is reversible, and `doctor` tells you which you
-actually need:
-
-```bash
-hd2-macro grant     # uinput access + keyboard hotkeys
-hd2-macro hide      # real controller: keep it out of the browser's gamepad list
-```
-
-`grant` covers two things: write access to `/dev/uinput` (required unless
-another package already installed a rule for it — see Requirements), and read
-access to keyboard event nodes (only needed for keyboard hotkeys). Skip `hide`
-if you have no physical controller. Undo either with `hd2-macro revoke` /
-`hd2-macro unhide`.
-
-### Start it
-
-```bash
-hd2-macro on
-systemctl --user enable hd2-macro     # optional: start at login
-```
-
-A healthy system looks like:
+That is the whole thing. The script installs `python-evdev` if missing, loads
+and persists the `uinput`/`joydev` modules, installs the udev rules, writes the
+config and systemd unit, hides any physical pad from the browser, starts the
+daemon and finishes by running `doctor`. It asks before each privileged step,
+prompts for sudo once, and is safe to re-run — it never overwrites an existing
+config.
 
 ```
+./install.sh --yes           # accept every default, no prompts
+./install.sh --no-grant      # skip the udev rules
+./install.sh --no-hide       # leave physical pads visible to the browser
+./install.sh --no-enable     # do not start at login
+./install.sh --uninstall     # undo everything (keeps your config)
+```
+
+A finished run ends with:
+
+```
+==> Verifying
 permissions
   [ok] /dev/uinput writable
   [ok] joydev module loaded
 config
-  [ok] hotkey names valid  11 bound
+  [ok] [hotkeys] has bindings  11 bound
   [ok] keyboards readable  Logitech G915 TKL ...
 gamepads
        /dev/input/js0  physical hidden   Microsoft Xbox Series S|X Controller
@@ -80,7 +50,44 @@ daemon
   [ok] running
 
 all good
+
+Ready. Open xbox.com/play in Chromium, click the page, then run:
+    hd2-macro wake
 ```
+
+### Requirements
+
+- `python-evdev`
+- the `joydev` and `uinput` kernel modules
+- write access to `/dev/uinput`
+
+`install.sh` handles all three. On a desktop that already has Steam or
+`logitech-udev-rules` installed, the last one works out of the box — those
+packages ship a udev rule tagging `uinput` with `uaccess`, so logind grants
+your active session an ACL. **A clean machine has no such rule and
+`/dev/uinput` stays root-only**, which makes the daemon fail to start.
+
+Joysticks are different: udev tags those with `uaccess` as standard, which is
+how the passthrough grab runs unprivileged everywhere.
+
+### Doing it by hand
+
+If you would rather not run a script, `install.sh` is only wrapping these:
+
+```bash
+sudo pacman -S --needed python-evdev
+./hd2-macro install     # config + ~/.local/bin symlink + systemd user unit
+hd2-macro grant         # udev rules: /dev/uinput + keyboard event nodes
+hd2-macro hide          # keep a physical pad out of the browser's gamepad list
+hd2-macro on
+systemctl --user enable hd2-macro
+hd2-macro doctor
+```
+
+`grant` and `hide` each need `sudo` once and are reversible with `hd2-macro
+revoke` / `hd2-macro unhide`. Skip `grant` if you only trigger macros from
+`pad:` buttons or Hyprland binds; skip `hide` if you have no physical
+controller. `doctor` tells you which you actually need.
 
 ### Other distros
 
@@ -440,7 +447,7 @@ hd2-macro daemon                      # run in the foreground instead
 | xCloud sees two controllers | `hd2-macro devices`, then `hd2-macro hide` |
 | real controller stops working | that's the grab — it's being forwarded; check `hd2-macro status` shows `passthrough=<name>` |
 | hotkeys do nothing | `hd2-macro status` — if `armed=False`, press `ALT+SHIFT+M` |
-| `/dev/uinput` not writable | `hd2-macro grant` — a clean machine has no uaccess rule for it |
+| `/dev/uinput` not writable | `hd2-macro grant`, or just re-run `./install.sh` |
 | daemon crash-loops on `UInputError` | same thing: `hd2-macro grant`, then `hd2-macro on` |
 | hotkeys listed but nothing fires | `hd2-macro doctor` — check `[hotkeys] has bindings` |
 | no keyboards listed by `doctor` | `hd2-macro grant` (or `sudo usermod -aG input $USER` + re-login) |
