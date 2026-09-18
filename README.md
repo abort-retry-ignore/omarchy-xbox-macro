@@ -4,8 +4,8 @@ Virtual Xbox 360 controller + keyboard-triggered macro sequences for
 **Xbox Cloud Gaming in Chromium**, built for Helldivers 2 stratagems on
 [Omarchy](https://omarchy.org) (Arch + Hyprland + Wayland).
 
-Press `F13` → the daemon holds `LB`, taps `↑↓→←↑` on the d-pad, releases.
-Reinforce called, without memorising a single code.
+Press `1` → the daemon holds `LB`, taps `↑→↓↑` on the d-pad, releases.
+Napalm strike called, without memorising a single code.
 
 ## Why a fake Xbox 360 pad?
 
@@ -88,26 +88,46 @@ unless you want keyboard hotkeys or `hide`. `hd2-macro doctor` confirms it all.
 
 ## Install
 
+On Arch/Omarchy:
+
 ```bash
-git clone <this repo> ~/Work/omarchy-xbox-macro
-cd ~/Work/omarchy-xbox-macro
-./hd2-macro install     # config + ~/.local/bin symlink + systemd user unit
-hd2-macro grant         # let this session read keyboards (for keyboard hotkeys)
-hd2-macro hide          # keep a real controller out of the browser's gamepad list
-hd2-macro on
+sudo pacman -S --needed python-evdev
+git clone https://github.com/abort-retry-ignore/omarchy-xbox-macro.git
+cd omarchy-xbox-macro
+./hd2-macro install
 hd2-macro doctor
 ```
 
-The two `sudo` steps are optional and independently reversible (`revoke` /
-`unhide`); skip `grant` if you only use `pad:` buttons, and `hide` if you have
-no real controller. A clean run ends with:
+`install` copies `config.example.toml` to `~/.config/hd2-macro/config.toml`,
+symlinks `hd2-macro` into `~/.local/bin`, and writes a systemd user unit. It
+never overwrites an existing config (pass `--force` if you want the defaults
+back). The script is a single file with no dependencies beyond `python-evdev`.
+
+Then, depending on what you need — both are optional, both need `sudo` once,
+and both are reversible:
+
+```bash
+hd2-macro grant     # keyboard hotkeys: let this session read keyboards
+hd2-macro hide      # real controller: keep it out of the browser's gamepad list
+```
+
+Skip `grant` if you only trigger macros from `pad:` buttons or Hyprland binds.
+Skip `hide` if you have no physical controller. Undo either with
+`hd2-macro revoke` / `hd2-macro unhide`.
+
+```bash
+hd2-macro on
+systemctl --user enable hd2-macro     # optional: start at login
+```
+
+A healthy system looks like:
 
 ```
 permissions
   [ok] /dev/uinput writable
   [ok] joydev module loaded
 config
-  [ok] hotkey names valid  13 bound
+  [ok] hotkey names valid  11 bound
   [ok] keyboards readable  Logitech G915 TKL ...
 gamepads
        /dev/input/js0  physical hidden   Microsoft Xbox Series S|X Controller
@@ -119,8 +139,14 @@ daemon
 all good
 ```
 
-`install` copies `config.example.toml` to `~/.config/hd2-macro/config.toml` and
-never overwrites it afterwards (use `--force` if you want the defaults back).
+### Other distros
+
+Nothing here is Omarchy-specific except the notification glyphs and the
+Hyprland focus gate, both optional. You need `python-evdev`, the `joydev`
+kernel module, and write access to `/dev/uinput` — on a systemd/logind desktop
+that last one is already granted to your active session by `uaccess`. If
+`hd2-macro doctor` says `/dev/uinput` is not writable, add yourself to a group
+with a udev rule, or run `sudo modprobe uinput` if the module is missing.
 
 ## Turning it on and off
 
