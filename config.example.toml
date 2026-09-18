@@ -1,6 +1,6 @@
 ####################################################################
 # hd2-macro config            ~/.config/hd2-macro/config.toml
-# Edit, then:  systemctl --user restart hd2-macro
+# Edits are picked up automatically within a few seconds.
 ####################################################################
 
 # ------------------------------------------------------------------

@@ -730,13 +730,10 @@ class Daemon:
         self.runner = Runner(self.pad, cfg, log=self.log)
         self.through = Passthrough(self.pad, cfg, on_button=self.handle, log=self.log)
         self.focus = HyprFocus(cfg, log=self.log)
-        self.hotkeys: dict[tuple[int, frozenset[str]], str] = {}
+        self.hotkeys, pad_hotkeys = self.compile_hotkeys(cfg)
+        self.through.hotkeys = pad_hotkeys
+        self.cfg_mtime = CONFIG.stat().st_mtime if CONFIG.exists() else 0.0
         self.mods: set[int] = set()
-        for key, target in cfg.get("hotkeys", {}).items():
-            if key.lower().startswith("pad:"):
-                self.through.hotkeys[padcode(key[4:])] = target
-            else:
-                self.hotkeys[parse_hotkey(key)] = target
         self.sel = selectors.DefaultSelector()
         self.keyboards: dict[str, InputDevice] = {}
         self._last_fire: dict[str, float] = {}
@@ -768,6 +765,51 @@ class Daemon:
                 continue
         if held != self.mods:
             self.mods = held
+
+    def compile_hotkeys(self, cfg) -> tuple[dict, dict]:
+        """Resolve the [hotkeys] table. Raises if any name is unknown, so a
+        typo can be rejected without disturbing what is already running."""
+        keys, pad = {}, {}
+        for name, target in cfg.get("hotkeys", {}).items():
+            if name.lower().startswith("pad:"):
+                pad[padcode(name[4:])] = target
+            else:
+                keys[parse_hotkey(name)] = target
+        return keys, pad
+
+    def maybe_reload(self):
+        """Pick up edits to the config file without a restart."""
+        try:
+            mtime = CONFIG.stat().st_mtime
+        except OSError:
+            return
+        if mtime == self.cfg_mtime:
+            return
+        self.cfg_mtime = mtime
+        try:
+            new = read_config()
+            keys, pad = self.compile_hotkeys(new)
+        except Exception as exc:  # noqa: BLE001 - bad edits must not kill the daemon
+            msg = str(exc).split("\n")[0][:140]
+            self.log(f"config reload REJECTED, keeping the running one: {msg}")
+            self.notify("Config error", msg, kind="panic", urgency="normal")
+            return
+
+        if new.get("pad", {}) != self.cfg.get("pad", {}):
+            self.log("note: [pad] changed, restart to recreate the virtual device")
+        # Runner and others hold a reference to this dict, so update in place.
+        self.cfg.clear()
+        self.cfg.update(new)
+        self.hotkeys = keys
+        self.through.hotkeys = pad
+        self.through.cfg = new.get("passthrough", {})
+        self.focus.match = [m.lower() for m in new.get("focus", {}).get("only_when", [])]
+        self.notify = Notifier(new, log=self.log)
+        self._last_fire.clear()
+        total = len(keys) + len(pad)
+        self.log(f"config reloaded: {total} hotkeys")
+        self.notify("Config reloaded", f"{total} hotkeys",
+                    kind="armed" if self.armed else "disarmed")
 
     def _on_key(self, dev):
         try:
@@ -845,6 +887,10 @@ class Daemon:
         if cmd == "quit":
             self.running = False
             return "ok bye"
+        if cmd == "reload":
+            self.cfg_mtime = 0.0
+            self.maybe_reload()
+            return f"ok reloaded, {len(self.hotkeys) + len(self.through.hotkeys)} hotkeys"
         if cmd == "run":
             name, _, qs = arg.partition("?")
             over = {}
@@ -930,6 +976,7 @@ class Daemon:
                 for key, _ in self.sel.select(timeout=1.0):
                     key.data(key.fileobj)
                 if time.monotonic() - last > 3:
+                    self.maybe_reload()
                     self.rescan()
                     last = time.monotonic()
         except KeyboardInterrupt:
@@ -955,11 +1002,16 @@ class Daemon:
 # client side
 # --------------------------------------------------------------------------
 
+def read_config(path: Path = CONFIG) -> dict:
+    """Parse the config, raising on any problem. Used by the live reloader."""
+    with path.open("rb") as fh:
+        return tomllib.load(fh)
+
+
 def load_config(path: Path = CONFIG) -> dict:
     if not path.exists():
         sys.exit(f"no config at {path}\nrun:  {APP} install")
-    with path.open("rb") as fh:
-        return tomllib.load(fh)
+    return read_config(path)
 
 
 def talk(line: str, quiet=False) -> str | None:
@@ -1344,6 +1396,7 @@ def main():
         ("panic", "release every button immediately"),
         ("wake", "nudge the pad so the browser exposes it to the page"),
         ("list", "list hotkeys, stratagems and macros"),
+        ("reload", "re-read the config now, without restarting"),
         ("keys", "press keys to learn their [hotkeys] names"),
         ("devices", "list gamepads and what the browser sees"),
         ("unhide", "remove the udev rule installed by `hide`"),

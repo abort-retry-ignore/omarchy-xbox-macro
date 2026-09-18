@@ -160,12 +160,38 @@ If xCloud stops responding to macros mid-session, `hd2-macro panic` then
 
 ## Configuration
 
-Everything lives in `~/.config/hd2-macro/config.toml`. After editing:
+Everything lives in `~/.config/hd2-macro/config.toml`. Save it and the daemon
+picks the changes up within a few seconds:
 
 ```bash
-systemctl --user restart hd2-macro
 hd2-macro list        # review hotkeys / stratagems / macros
 ```
+
+### Editing the config
+
+The daemon watches `~/.config/hd2-macro/config.toml` and picks up changes
+within about three seconds — no restart needed. Save the file and the new
+hotkeys, timings, stratagem codes and macros are live.
+
+A bad edit is never applied. Invalid TOML, or a hotkey naming a key that does
+not exist, is rejected wholesale and the daemon keeps running on the last good
+config:
+
+```
+[hd2-macro] config reload REJECTED, keeping the running one: Expected '=' after a key in a key/value pair (at line 304, column 6)
+[hd2-macro] config reload REJECTED, keeping the running one: unknown key 'NOSUCHKEY' (evdev KEY_* name, e.g. F13, KP1)
+```
+
+You also get a `Config error` notification, so a typo mid-session is obvious
+rather than silent. To force a reload immediately:
+
+```bash
+hd2-macro reload
+```
+
+The one exception is the `[pad]` table — changing the virtual controller's
+identity means recreating the uinput device, which needs
+`systemctl --user restart hd2-macro`. The daemon logs a reminder if you edit it.
 
 ### Hotkeys
 
