@@ -15,11 +15,15 @@ Napalm strike called, without memorising a single code.
 - the `joydev` kernel module (loaded by default on Arch)
 - write access to `/dev/uinput`
 
-On Omarchy that last one already works: udev tags `uinput` with `uaccess`, so
-logind grants your active session an ACL. The same applies to joysticks, which
-is how the passthrough grab runs unprivileged. No sudo, no group changes and no
-udev rule are needed unless you want keyboard hotkeys or `hide`, both covered
-below. `hd2-macro doctor` checks all of it for you.
+On a desktop that already has Steam or `logitech-udev-rules` installed, the
+last one works out of the box — those packages ship a udev rule tagging
+`uinput` with `uaccess`, so logind grants your active session an ACL. **A clean
+machine has no such rule and `/dev/uinput` stays root-only**, which makes the
+daemon fail to start. `hd2-macro grant` installs the rule, and `hd2-macro
+doctor` tells you whether you need it.
+
+Joysticks are different: udev tags those with `uaccess` as standard, which is
+how the passthrough grab runs unprivileged everywhere.
 
 ### Arch / Omarchy
 
@@ -38,17 +42,19 @@ back. The program is a single file with no dependencies beyond `python-evdev`.
 
 ### Optional privileged steps
 
-Both need `sudo` once, both are reversible, and `doctor` tells you which you
+Each needs `sudo` once, each is reversible, and `doctor` tells you which you
 actually need:
 
 ```bash
-hd2-macro grant     # keyboard hotkeys: let this session read keyboards
+hd2-macro grant     # uinput access + keyboard hotkeys
 hd2-macro hide      # real controller: keep it out of the browser's gamepad list
 ```
 
-Skip `grant` if you only trigger macros from `pad:` buttons or Hyprland binds.
-Skip `hide` if you have no physical controller. Undo either with `hd2-macro
-revoke` / `hd2-macro unhide`.
+`grant` covers two things: write access to `/dev/uinput` (required unless
+another package already installed a rule for it — see Requirements), and read
+access to keyboard event nodes (only needed for keyboard hotkeys). Skip `hide`
+if you have no physical controller. Undo either with `hd2-macro revoke` /
+`hd2-macro unhide`.
 
 ### Start it
 
@@ -80,10 +86,11 @@ all good
 
 Nothing here is Omarchy-specific except the notification glyphs and the
 Hyprland focus gate, both optional. You need `python-evdev`, the `joydev`
-kernel module, and write access to `/dev/uinput` — on any systemd/logind
-desktop that last one is already granted to your active session via `uaccess`.
-If `hd2-macro doctor` reports `/dev/uinput` is not writable, run `sudo modprobe
-uinput`, or add yourself to a group with a udev rule.
+kernel module, and write access to `/dev/uinput`. On any systemd/logind desktop
+`hd2-macro grant` handles that last one by tagging `uinput` for `uaccess`, so
+the ACL follows whoever is logged in at the seat. If `doctor` still reports it
+unwritable afterwards, check `loginctl` shows your session as `Active=yes` — an
+ssh-only session never gets a uaccess ACL.
 
 ## Turning it on and off
 
@@ -433,7 +440,9 @@ hd2-macro daemon                      # run in the foreground instead
 | xCloud sees two controllers | `hd2-macro devices`, then `hd2-macro hide` |
 | real controller stops working | that's the grab — it's being forwarded; check `hd2-macro status` shows `passthrough=<name>` |
 | hotkeys do nothing | `hd2-macro status` — if `armed=False`, press `ALT+SHIFT+M` |
-| `/dev/uinput` not writable | you're on a remote or inactive session; `loginctl` seat must be active |
+| `/dev/uinput` not writable | `hd2-macro grant` — a clean machine has no uaccess rule for it |
+| daemon crash-loops on `UInputError` | same thing: `hd2-macro grant`, then `hd2-macro on` |
+| hotkeys listed but nothing fires | `hd2-macro doctor` — check `[hotkeys] has bindings` |
 | no keyboards listed by `doctor` | `hd2-macro grant` (or `sudo usermod -aG input $USER` + re-login) |
 | keyboard plugged in mid-session | give it a few seconds; the daemon rescans every 3s |
 | don't know a key's name | `hd2-macro keys` |
