@@ -1042,12 +1042,18 @@ def cmd_devices(args):
     return 0
 
 
-GRANT_RULE = """# Installed by hd2-macro ({app} grant). Grants the active local session an
-# ACL on keyboard event devices so hd2-macro can read hotkeys. udev already
-# does exactly this for joysticks (70-uaccess.rules); this extends it to
-# keyboards, without putting the user in the `input` group -- the ACL only
-# applies to whoever is physically logged in at the seat, and disappears when
-# they log out. Remove with: {app} revoke
+GRANT_RULE = """# Installed by hd2-macro ({app} grant).
+#
+# 1. /dev/uinput: needed to create the virtual pad. Some systems get this
+#    for free because Steam or logitech-udev-rules ship the same rule, but
+#    a clean machine has no rule at all and the node stays root-only.
+# 2. keyboard event nodes: needed for keyboard hotkeys. udev already does
+#    this for joysticks (70-uaccess.rules); this extends it to keyboards
+#    without putting the user in the `input` group.
+#
+# uaccess grants an ACL only to whoever is physically logged in at the
+# seat, and it is dropped on logout. Remove with: {app} revoke
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
 SUBSYSTEM=="input", KERNEL=="event*", ENV{{ID_INPUT_KEYBOARD}}=="?*", TAG+="uaccess"
 SUBSYSTEM=="input", KERNEL=="event*", ENV{{ID_INPUT_KEY}}=="?*", TAG+="uaccess"
 """
@@ -1056,6 +1062,8 @@ SUBSYSTEM=="input", KERNEL=="event*", ENV{{ID_INPUT_KEY}}=="?*", TAG+="uaccess"
 def _reload_udev():
     subprocess.call(["sudo", "udevadm", "control", "--reload"])
     subprocess.call(["sudo", "udevadm", "trigger", "--subsystem-match=input",
+                     "--action=change"])
+    subprocess.call(["sudo", "udevadm", "trigger", "--subsystem-match=misc",
                      "--action=change"])
     subprocess.call(["sudo", "udevadm", "settle"])
 
@@ -1068,16 +1076,26 @@ def cmd_grant(args):
                         input=text.encode(), stdout=subprocess.DEVNULL).returncode
     if rc:
         return rc
+    subprocess.call(["sudo", "modprobe", "uinput"])
     _reload_udev()
+    ok = True
+    if os.access("/dev/uinput", os.W_OK):
+        print("/dev/uinput is writable")
+    else:
+        ok = False
+        print("/dev/uinput still NOT writable -- are you logged in locally at the seat?\n"
+              "   an ssh-only session gets no uaccess ACL; log in at the machine,\n"
+              "   or add yourself to a group that owns the node")
     kbs = find_keyboards([], set())
     if kbs:
-        print(f"readable now: {', '.join(d.name for d in kbs[:4])}")
+        print(f"keyboards readable: {', '.join(d.name for d in kbs[:4])}")
         for d in kbs:
             d.close()
-        print(f"\nrestart the daemon to pick them up:  {APP} off && {APP} on")
-        return 0
-    print("no keyboards readable yet -- try `sudo usermod -aG input $USER` and re-login")
-    return 1
+    else:
+        ok = False
+        print("no keyboards readable -- `sudo usermod -aG input $USER` and re-login")
+    print(f"\nrestart the daemon to pick this up:  {APP} off && {APP} on")
+    return 0 if ok else 1
 
 
 def cmd_revoke(args):
@@ -1170,7 +1188,7 @@ def cmd_doctor(args):
 
     print("permissions")
     w = os.access("/dev/uinput", os.W_OK)
-    check("/dev/uinput writable", w, "" if w else "-> inactive session, or no uaccess ACL")
+    check("/dev/uinput writable", w, "" if w else f"-> {APP} grant  (installs a uaccess rule)")
     joydev = b"joydev" in subprocess.run(["lsmod"], capture_output=True).stdout
     check("joydev module loaded", joydev, "" if joydev else "-> sudo modprobe joydev")
 
@@ -1179,11 +1197,25 @@ def cmd_doctor(args):
     cfg = {}
     if CONFIG.exists():
         cfg = load_config()
-        kb_keys = [k for k in cfg.get("hotkeys", {}) if not k.lower().startswith("pad:")]
+        hk = cfg.get("hotkeys", {})
+        kb_keys = [k for k in hk if not k.lower().startswith("pad:")]
+        # A mangled [hotkeys] header still parses as valid TOML, it just
+        # lands the bindings in the previous table. Catch that here rather
+        # than leaving the user with a daemon that does nothing.
+        check("[hotkeys] has bindings", bool(hk),
+              f"{len(hk)} bound" if hk else
+              "-> no [hotkeys] table found; check the section header in the config")
+        stray = [k for k in ("1", "2", "3", "toggle", "panic")
+                 if k in cfg.get("passthrough", {}) or k in cfg.get("keyboards", {})]
+        if stray:
+            check("no misplaced hotkeys", False,
+                  f"found {stray} under [passthrough]/[keyboards] -- a broken "
+                  f"[hotkeys] header above them")
         try:
-            for k in cfg.get("hotkeys", {}):
+            for k in hk:
                 padcode(k[4:]) if k.lower().startswith("pad:") else parse_hotkey(k)
-            check("hotkey names valid", True, f"{len(cfg.get('hotkeys', {}))} bound")
+            if hk:
+                check("hotkey names valid", True, f"{len(hk)} bound")
         except KeyError as exc:
             check("hotkey names valid", False, str(exc))
         if kb_keys:

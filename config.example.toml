@@ -99,7 +99,36 @@ enabled = true
 match   = []           # [] = first gamepad found; or ["Xbox"] / ["045e:0b12"]
 
 # ------------------------------------------------------------------
-# Keyboards to watch (only used if [hotkeys]
+# Keyboards to watch. Only used when [hotkeys] has keyboard entries.
+# ------------------------------------------------------------------
+[keyboards]
+match = []             # [] = every keyboard; or e.g. ["G915", "AT Translated"]
+
+# ------------------------------------------------------------------
+# Hotkeys:  <key> = "<target>"
+#
+# Targets:
+#   "reinforce"        a [stratagems] entry
+#   "strat:UDRLU"      a literal code, no entry needed
+#   "macro:dive_prone" a [macros.*] block
+#   "press:A 300"      one button for 300ms
+#   "toggle"           arm/disarm without stopping the daemon
+#   "panic"            release everything
+#   "wake"             nudge the pad so the browser exposes it
+#
+# Keys:
+#   "1", "F13"      an evdev KEY_* name, minus the prefix
+#   "ALT+SHIFT+M"   a chord; modifiers are CTRL, ALT, SHIFT, SUPER
+#   "pad:RECORD"    a button on the passed-through controller
+#
+# Matching is exact: `1` fires only on a bare 1, never on SHIFT+1.
+# Keyboard keys need read access to keyboards -- run `hd2-macro grant`.
+# `pad:` buttons need no extra permissions and are consumed, never
+# forwarded to the game.
+#
+# Find the name of any key or chord with:  hd2-macro keys
+# ------------------------------------------------------------------
+[hotkeys]
 # The digit row: one stratagem each. Swap the names for your loadout --
 # anything from [stratagems] below, or "strat:URDDD" for a raw code.
 1 = "eagle_napalm_airstrike"
