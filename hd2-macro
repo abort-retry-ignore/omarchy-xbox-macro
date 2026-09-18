@@ -312,6 +312,10 @@ class Cancelled(Exception):
     pass
 
 
+class Busy(Exception):
+    """A macro is already running and on_busy is 'ignore'."""
+
+
 def parse_code(s: str) -> list[str]:
     """'UDRLU' / 'up down right' / arrows -> ['UP','DOWN','RIGHT','LEFT','UP']"""
     out = []
@@ -376,6 +380,11 @@ class Runner:
         steps = self.resolve(name)
         with self.lock:
             if self.busy:
+                if self.cfg.get("timing", {}).get("on_busy", "ignore") != "restart":
+                    raise Busy(name)
+                # Restarting mid-stratagem releases the hold button and presses
+                # it again; HD2 reads that second press as a cancel and stows
+                # the beacon. Only do it when explicitly asked for.
                 self.cancel.set()
                 self.thread.join(timeout=1.0)
             self.cancel = threading.Event()
@@ -730,6 +739,7 @@ class Daemon:
                 self.hotkeys[parse_hotkey(key)] = target
         self.sel = selectors.DefaultSelector()
         self.keyboards: dict[str, InputDevice] = {}
+        self._last_fire: dict[str, float] = {}
         self.srv = None
 
     def log(self, msg):
@@ -876,8 +886,20 @@ class Daemon:
             return "err disarmed"
         if not force and not self.focus.allowed:
             return f"err window not focused ({self.focus.cls or 'none'})"
+        # One physical keypress can surface on several event nodes -- a single
+        # Logitech receiver here exposes three that all carry the digit row --
+        # and each would otherwise re-trigger the macro.
+        debounce = float(self.cfg.get("timing", {}).get("debounce_ms", 300)) / 1000.0
+        now = time.monotonic()
+        if not force and now - self._last_fire.get(target, 0.0) < debounce:
+            self.log(f"debounced {target}")
+            return f"err debounced {target}"
+        self._last_fire[target] = now
         try:
             self.runner.fire(target, over=over)
+        except Busy:
+            self.log(f"busy, ignored {target}")
+            return "err busy"
         except KeyError as exc:
             self.log(str(exc))
             return f"err {exc}"
