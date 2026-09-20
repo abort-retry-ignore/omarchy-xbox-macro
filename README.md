@@ -455,9 +455,10 @@ one, and accept that it will cancel a stratagem in progress.
 
 ## Stratagem codes
 
-`config.example.toml` ships the common Helldivers 2 codes. **Verify them
-against your loadout** — Arrowhead adjusts codes between patches, and you only
-need the ones you actually bring.
+`config.example.toml` ships every code from
+<https://helldivers.wiki.gg/wiki/Stratagems>, grouped like that page.
+**Verify them against your loadout** — Arrowhead adjusts codes between patches,
+and you only need the ones you actually bring.
 
 ## Troubleshooting
 
