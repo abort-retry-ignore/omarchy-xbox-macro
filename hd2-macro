@@ -1369,15 +1369,10 @@ def cmd_keys(args):
 
 def cmd_list(args):
     cfg = load_config()
-    print("hotkeys")
-    for k, v in cfg.get("hotkeys", {}).items():
-        print(f"  {k:<14} {v}")
-    print("\nstratagems")
-    for k, v in sorted(cfg.get("stratagems", {}).items()):
-        print(f"  {k:<28} {v}")
-    print("\nmacros")
-    for k in sorted(cfg.get("macros", {})):
-        print(f"  {k}")
+    digits = sorted((k, v) for k, v in cfg.get("hotkeys", {}).items()
+                    if len(k) == 1 and k.isdigit())
+    for k, v in digits:
+        print(f"  {k:<4} {v}")
     return 0
 
 
@@ -1395,7 +1390,7 @@ def main():
         ("disarm", "ignore hotkeys, keep the pad connected"),
         ("panic", "release every button immediately"),
         ("wake", "nudge the pad so the browser exposes it to the page"),
-        ("list", "list hotkeys, stratagems and macros"),
+        ("list", "show what the 0-9 keys are bound to"),
         ("reload", "re-read the config now, without restarting"),
         ("keys", "press keys to learn their [hotkeys] names"),
         ("devices", "list gamepads and what the browser sees"),

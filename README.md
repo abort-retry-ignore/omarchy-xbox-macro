@@ -164,7 +164,7 @@ Everything lives in `~/.config/hd2-macro/config.toml`. Save it and the daemon
 picks the changes up within a few seconds:
 
 ```bash
-hd2-macro list        # review hotkeys / stratagems / macros
+hd2-macro list        # show what the 0-9 keys are bound to
 ```
 
 ### Editing the config
