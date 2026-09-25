@@ -21,6 +21,26 @@ disarmed = "\U000F05BB"   # nf-md-microsoft_xbox_controller_off
 panic    = "\U000F073A"   # nf-md-cancel
 
 # ------------------------------------------------------------------
+# Keyboard backlight. Dell firmware switches the light off ~10s after
+# the last keystroke -- and while you are on the pad there are none,
+# so the light goes dark mid-match. While macros are armed the daemon
+# pins the LED's stop_timeout high and restores the old value on
+# disarm (or when the daemon stops).
+#
+# Writing those sysfs files needs a one-time privilege step: re-run
+# `hd2-macro grant`, which also chowns the LED's files to your user at
+# boot. Without it the daemon just logs a permission error and the
+# light behaves as before.
+# ------------------------------------------------------------------
+[backlight]
+enabled = true
+led     = "dell::kbd_backlight"  # /sys/class/leds/<name>
+level   = 1                      # brightness held while armed; null = leave as set
+pin     = "12h"                  # inactivity timeout while armed. Most Dell
+                                 # firmware rejects 0 (= never); 12h outlasts
+                                 # any match, and disarm restores the old value
+
+# ------------------------------------------------------------------
 # Virtual pad identity. Leave alone unless you know what you're doing:
 # Chromium picks the "standard" gamepad mapping from vendor/product,
 # and xbox.com/play refuses anything it can't map.

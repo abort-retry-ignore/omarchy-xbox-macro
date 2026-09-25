@@ -42,6 +42,9 @@ permissions
 config
   [ok] [hotkeys] has bindings  11 bound
   [ok] keyboards readable  Logitech G915 TKL ...
+backlight
+  [ok] kbd backlight writable
+       stop_timeout=0s
 gamepads
        /dev/input/js0  physical hidden   Microsoft Xbox Series S|X Controller
        /dev/input/js1  virtual  VISIBLE  Microsoft X-Box 360 pad
@@ -77,7 +80,7 @@ If you would rather not run a script, `install.sh` is only wrapping these:
 ```bash
 sudo pacman -S --needed python-evdev
 ./hd2-macro install     # config + ~/.local/bin symlink + systemd user unit
-hd2-macro grant         # udev rules: /dev/uinput + keyboard event nodes
+hd2-macro grant         # udev rules: /dev/uinput + keyboard event nodes + kbd backlight
 hd2-macro hide          # keep a physical pad out of the browser's gamepad list
 hd2-macro on
 systemctl --user enable hd2-macro
@@ -141,6 +144,34 @@ armed    = "\U000F05BA"     # nf-md-microsoft_xbox_controller
 disarmed = "\U000F05BB"     # nf-md-microsoft_xbox_controller_off
 panic    = "\U000F073A"     # nf-md-cancel
 ```
+
+## Keyboard backlight
+
+While macros are armed, the daemon also holds the keyboard backlight on.
+Dell firmware switches the light off `stop_timeout` (10s here) after the last
+keyboard or touchpad event — and while you are on the pad there are none, so
+the light goes dark mid-match. Armed, the daemon pins `stop_timeout` high
+(`pin`, default 12h — this firmware rejects 0 = "never", and 12h outlasts any
+match); on disarm, `hd2-macro off` or a daemon stop it restores exactly the
+value and level it found.
+
+```toml
+[backlight]
+enabled = true
+led     = "dell::kbd_backlight"  # /sys/class/leds/<name>
+level   = 1                      # brightness held while armed; null = leave as set
+pin     = "12h"                  # timeout while armed; s/m/h/d units
+```
+
+Writing those sysfs files needs one extra one-time privilege, folded into
+`grant`: it also chowns the LED's `brightness` and `stop_timeout` files to
+your user at boot (sysfs has no `/dev` node, so uaccess does not apply
+there). Until then every arm just logs a permission error and the light
+behaves as before. `doctor` reports the state.
+
+One benign residue: if the daemon is killed mid-game, the timeout stays
+pinned until the next arm/disarm cycle or a reboot — and even then it is a
+12h timer, not "forever". A light left on is the whole extent of the damage.
 
 ## Using it with xCloud
 
@@ -474,6 +505,7 @@ hd2-macro daemon                      # run in the foreground instead
 | xCloud sees two controllers | `hd2-macro devices`, then `hd2-macro hide` |
 | real controller stops working | that's the grab — it's being forwarded; check `hd2-macro status` shows `passthrough=<name>` |
 | hotkeys do nothing | `hd2-macro status` — if `armed=False`, press `ALT+SHIFT+M` |
+| keyboard light goes dark while playing | `hd2-macro grant` (chowns the backlight sysfs files), then `hd2-macro reload` |
 | `/dev/uinput` not writable | `hd2-macro grant`, or just re-run `./install.sh` |
 | daemon crash-loops on `UInputError` | same thing: `hd2-macro grant`, then `hd2-macro on` |
 | hotkeys listed but nothing fires | `hd2-macro doctor` — check `[hotkeys] has bindings` |

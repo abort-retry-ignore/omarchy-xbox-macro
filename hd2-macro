@@ -11,6 +11,10 @@ If you also play with a real controller, passthrough mode grabs it exclusively
 and merges its input into the virtual pad, so the browser only ever sees one
 gamepad.
 
+While armed it also holds the keyboard backlight on -- the Dell firmware
+dims it 10s after the last keystroke, and there are none while you play on
+the pad ([backlight] in the config).
+
   hd2-macro install     config + systemd user unit + PATH symlink
   hd2-macro on|off|toggle|status
   hd2-macro run NAME    fire a macro via the running daemon
@@ -23,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import getpass
 import json
 import os
 import re
@@ -651,6 +656,112 @@ class Notifier:
             self.log(f"notify failed: {exc}")
 
 
+class Backlight:
+    """Keyboard backlight held on while the hotkeys are armed.
+
+    The Dell firmware switches the light off stop_timeout (10s here) after
+    the last keyboard or touchpad event -- and while you are playing on the
+    pad there are none. While armed the daemon pins the LED's stop_timeout
+    high ([backlight] pin, default 12h -- the most this firmware accepts;
+    some models take 0 = truly never) and on disarm (or daemon stop)
+    restores the value it found.
+
+    The sysfs files are root-owned; `hd2-macro grant` chowns them to your
+    user at boot. Without that, writes fail and this class just logs -- it
+    must never take the daemon down over a light.
+    """
+
+    def __init__(self, cfg, log=print):
+        section = cfg.get("backlight", {}) or {}
+        self.enabled = bool(section.get("enabled", True))
+        self.level = self._level(section.get("level"))
+        self.pin = str(section.get("pin", "12h"))
+        self.base = self._base(str(section.get("led", "dell::kbd_backlight")))
+        self.saved: dict[str, str] | None = None
+        self.log = log
+
+    @staticmethod
+    def _base(led: str) -> Path:
+        return Path(led) if led.startswith("/") else Path("/sys/class/leds") / led
+
+    @staticmethod
+    def _level(value) -> int | None:
+        if value is None:
+            return None
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def available(self) -> bool:
+        return self.enabled and (self.base / "stop_timeout").is_file()
+
+    def arm(self):
+        """Pin the light on for an armed session. Idempotent, never raises."""
+        if not self.available:
+            return
+        if self.saved is None:
+            try:
+                saved = {"stop_timeout": (self.base / "stop_timeout").read_text().strip()}
+                if self.level is not None:
+                    saved["brightness"] = (self.base / "brightness").read_text().strip()
+            except OSError as exc:
+                self.log(f"backlight: cannot read {self.base} ({exc.strerror})")
+                return
+        wrote = False
+        try:
+            (self.base / "stop_timeout").write_text(f"{self.pin}\n")
+            wrote = True
+            if self.level is not None:
+                (self.base / "brightness").write_text(f"{self.level}\n")
+        except OSError as exc:
+            if self.saved is None and wrote:
+                try:  # timeout pinned but the level failed: undo the pin
+                    (self.base / "stop_timeout").write_text(saved["stop_timeout"] + "\n")
+                except OSError:
+                    pass
+            self.log(f"backlight: cannot hold the light ({exc.strerror}) -- check "
+                     f"`{APP} grant` for write access, or the firmware rejected "
+                     f"pin={self.pin!r}")
+            return
+        if self.saved is None:
+            self.saved = saved
+            self.log(f"backlight held on (stop_timeout was {saved['stop_timeout']!r}; "
+                     f"restored on disarm)")
+
+    def disarm(self):
+        """Restore whatever arm() found. Never raises."""
+        if not self.saved:
+            return
+        saved, self.saved = self.saved, None
+        try:
+            (self.base / "stop_timeout").write_text(saved["stop_timeout"] + "\n")
+            if self.level is not None and "brightness" in saved:
+                (self.base / "brightness").write_text(saved["brightness"] + "\n")
+            self.log(f"backlight released (stop_timeout back to {saved['stop_timeout']!r})")
+        except OSError as exc:
+            self.log(f"backlight restore failed: {exc.strerror}")
+
+    def update(self, section):
+        """Adopt a reloaded [backlight]; re-pin cleanly if it was held."""
+        section = section or {}
+        new_base = self._base(str(section.get("led", "dell::kbd_backlight")))
+        new_level = self._level(section.get("level"))
+        new_enabled = bool(section.get("enabled", True))
+        new_pin = str(section.get("pin", "12h"))
+        if (new_base == self.base and new_level == self.level
+                and new_enabled == self.enabled and new_pin == self.pin):
+            return
+        was_held = self.saved is not None
+        if was_held:
+            self.disarm()  # restores against the old base before it changes
+        self.base, self.level, self.enabled = new_base, new_level, new_enabled
+        self.pin = new_pin
+        if was_held and self.enabled:
+            self.arm()
+
+
 def keycode(name: str) -> int:
     n = name.upper()
     if not n.startswith("KEY_"):
@@ -732,6 +843,8 @@ class Daemon:
         self.focus = HyprFocus(cfg, log=self.log)
         self.hotkeys, pad_hotkeys = self.compile_hotkeys(cfg)
         self.through.hotkeys = pad_hotkeys
+        self.light = Backlight(cfg, log=self.log)
+        self.light.arm()          # the daemon starts armed
         self.cfg_mtime = CONFIG.stat().st_mtime if CONFIG.exists() else 0.0
         self.mods: set[int] = set()
         self.sel = selectors.DefaultSelector()
@@ -805,6 +918,9 @@ class Daemon:
         self.through.cfg = new.get("passthrough", {})
         self.focus.match = [m.lower() for m in new.get("focus", {}).get("only_when", [])]
         self.notify = Notifier(new, log=self.log)
+        self.light.update(new.get("backlight", {}))
+        if self.armed:
+            self.light.arm()
         self._last_fire.clear()
         total = len(keys) + len(pad)
         self.log(f"config reloaded: {total} hotkeys")
@@ -873,15 +989,20 @@ class Daemon:
             src = self.through.dev.name if self.through.dev else "none"
             gate = (f"focus={'PASS' if self.focus.allowed else 'BLOCKED'}"
                     f"({self.focus.cls or '-'}) " if self.focus.gating else "")
+            light = (f" backlight={'held' if self.light.saved else 'auto'}"
+                     if self.light.available else "")
             return (f"ok running armed={self.armed} pad={self.pad.path} "
-                    f"js={self.pad.js} passthrough={src} {gate}busy={self.runner.busy}")
+                    f"js={self.pad.js} passthrough={src} {gate}busy={self.runner.busy}"
+                    f"{light}")
         if cmd == "arm":
             self.armed = True
+            self.light.arm()
             self.announce()
             return "ok armed"
         if cmd == "disarm":
             self.armed = False
             self.runner.stop()
+            self.light.disarm()
             self.announce()
             return "ok disarmed"
         if cmd == "quit":
@@ -915,6 +1036,9 @@ class Daemon:
             self.armed = not self.armed
             if not self.armed:
                 self.runner.stop()
+                self.light.disarm()
+            else:
+                self.light.arm()
             self.announce()
             self.log("armed" if self.armed else "disarmed")
             return f"ok armed={self.armed}"
@@ -985,6 +1109,7 @@ class Daemon:
             self.shutdown()
 
     def shutdown(self):
+        self.light.disarm()
         self.runner.stop()
         for dev in self.keyboards.values():
             dev.close()
@@ -1102,12 +1227,18 @@ GRANT_RULE = """# Installed by hd2-macro ({app} grant).
 # 2. keyboard event nodes: needed for keyboard hotkeys. udev already does
 #    this for joysticks (70-uaccess.rules); this extends it to keyboards
 #    without putting the user in the `input` group.
+# 3. keyboard backlight: Dell firmware switches the light off ~10s after
+#    the last keystroke, and {app} pins the LED's stop_timeout to "never"
+#    while macros are armed. sysfs has no /dev node, so uaccess does not
+#    apply here -- the files are chowned to the invoking user instead.
 #
 # uaccess grants an ACL only to whoever is physically logged in at the
 # seat, and it is dropped on logout. Remove with: {app} revoke
 KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
 SUBSYSTEM=="input", KERNEL=="event*", ENV{{ID_INPUT_KEYBOARD}}=="?*", TAG+="uaccess"
 SUBSYSTEM=="input", KERNEL=="event*", ENV{{ID_INPUT_KEY}}=="?*", TAG+="uaccess"
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="*kbd_backlight", \
+  RUN+="/bin/sh -c '/usr/bin/chown {owner} /sys/class/leds/%k/brightness /sys/class/leds/%k/stop_timeout 2>/dev/null; true'"
 """
 
 
@@ -1117,11 +1248,13 @@ def _reload_udev():
                      "--action=change"])
     subprocess.call(["sudo", "udevadm", "trigger", "--subsystem-match=misc",
                      "--action=change"])
+    subprocess.call(["sudo", "udevadm", "trigger", "--subsystem-match=leds",
+                     "--action=add"])
     subprocess.call(["sudo", "udevadm", "settle"])
 
 
 def cmd_grant(args):
-    text = GRANT_RULE.format(app=APP)
+    text = GRANT_RULE.format(app=APP, owner=getpass.getuser())
     print(f"installing {UDEV_GRANT}:\n")
     print(text)
     rc = subprocess.run(["sudo", "tee", str(UDEV_GRANT)],
@@ -1146,6 +1279,14 @@ def cmd_grant(args):
     else:
         ok = False
         print("no keyboards readable -- `sudo usermod -aG input $USER` and re-login")
+    led = Path("/sys/class/leds/dell::kbd_backlight")
+    if (led / "stop_timeout").is_file():
+        if os.access(led / "stop_timeout", os.W_OK):
+            print("kbd backlight sysfs writable -- the light can be pinned while armed")
+        else:
+            print("kbd backlight sysfs NOT writable -- udev applies the chown at the "
+                  "next boot,\n   or now:  sudo chown $USER "
+                  f"{led}/stop_timeout {led}/brightness")
     print(f"\nrestart the daemon to pick this up:  {APP} off && {APP} on")
     return 0 if ok else 1
 
@@ -1279,6 +1420,25 @@ def cmd_doctor(args):
         else:
             print("  [--] no keyboard hotkeys configured (using Hyprland binds?)")
 
+    print("backlight")
+    bl = cfg.get("backlight", {}) or {}
+    if not bl.get("enabled", True):
+        print("  [--] disabled in [backlight]")
+    else:
+        led = Path(str(bl.get("led", "dell::kbd_backlight")))
+        led = led if led.is_absolute() else Path("/sys/class/leds") / led
+        stop = led / "stop_timeout"
+        if not stop.is_file():
+            print(f"  [--] no {stop} (fine on machines without that LED)")
+        else:
+            w = os.access(stop, os.W_OK)
+            check("kbd backlight writable", w,
+                  "" if w else f"-> {APP} grant  (pins the light while armed)")
+            try:
+                print(f"       stop_timeout={stop.read_text().strip()}")
+            except OSError:
+                pass
+
     print("gamepads")
     pads = gamepads()
     for g in pads:
@@ -1395,7 +1555,7 @@ def main():
         ("keys", "press keys to learn their [hotkeys] names"),
         ("devices", "list gamepads and what the browser sees"),
         ("unhide", "remove the udev rule installed by `hide`"),
-        ("grant", "let this session read keyboards, for keyboard hotkeys"),
+        ("grant", "let this session read keyboards and the kbd backlight, for hotkeys"),
         ("revoke", "remove the udev rule installed by `grant`"),
         ("doctor", "diagnose the setup"),
     ]:
