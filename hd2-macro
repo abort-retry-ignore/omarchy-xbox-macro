@@ -682,7 +682,21 @@ class Backlight:
 
     @staticmethod
     def _base(led: str) -> Path:
-        return Path(led) if led.startswith("/") else Path("/sys/class/leds") / led
+        if led.startswith("/"):
+            return Path(led)
+        if led:
+            return Path("/sys/class/leds") / led
+        # Empty [backlight] led: first *kbd_backlight* that can be pinned.
+        # Shared chezmoi configs leave this blank so a G915 host and this
+        # Dell can share one file; only the Dell LED has stop_timeout.
+        root = Path("/sys/class/leds")
+        try:
+            for p in sorted(root.glob("*kbd_backlight")):
+                if (p / "stop_timeout").is_file():
+                    return p
+        except OSError:
+            pass
+        return root
 
     @staticmethod
     def _level(value) -> int | None:
@@ -1425,8 +1439,7 @@ def cmd_doctor(args):
     if not bl.get("enabled", True):
         print("  [--] disabled in [backlight]")
     else:
-        led = Path(str(bl.get("led", "dell::kbd_backlight")))
-        led = led if led.is_absolute() else Path("/sys/class/leds") / led
+        led = Backlight._base(str(bl.get("led", "dell::kbd_backlight")))
         stop = led / "stop_timeout"
         if not stop.is_file():
             print(f"  [--] no {stop} (fine on machines without that LED)")
