@@ -467,8 +467,13 @@ false` and skip `hide`.
 ## SteelSeries Nimbus
 
 The **original Bluetooth Nimbus (`0111:1420`)**, not Nimbus+ or Nimbus Cloud,
-needs the per-controller profile in `config.example.toml`. It inverts both
-stick Y axes, moves Z/RZ to the right stick, and maps its unusual HID button
+needs the per-controller profile in `config.example.toml`. Another machine that
+also uses this pad needs two steps there — `git pull` in its clone, then a
+re-run of `./install.sh` (safe, keeps the config) — which offers the udev rule
+and restarts the daemon. The config profile itself arrives via that machine's
+dotfiles sync; the **code must be pulled first**, older versions ignore
+`profile` blocks and would leave its sticks and buttons mismatched. It inverts
+both stick Y axes, moves Z/RZ to the right stick, and maps its unusual HID button
 numbering to Xbox controls. The Menu button serves as **View/Back** (two boxes,
 browser **B8**), rather than Menu/Start (three lines, B9). This model has no
 clickable sticks or separate Start/Guide buttons. The profile emulates stick
