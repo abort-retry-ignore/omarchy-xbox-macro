@@ -69,7 +69,7 @@ if [[ $UNINSTALL == 1 ]]; then
   "$BIN" revoke  || true
   "$BIN" unhide  || true
   rm -f "$HOME/.local/bin/$APP" "$HOME/.config/systemd/user/$APP.service"
-  sudo rm -f /etc/modules-load.d/$APP.conf
+  sudo rm -f /etc/modules-load.d/$APP.conf /etc/udev/rules.d/70-$APP-nimbus.rules
   systemctl --user daemon-reload || true
   ok "removed binary, unit and udev rules"
   note "your config is kept at ~/.config/$APP/config.toml"
@@ -170,6 +170,20 @@ if [[ $DO_GRANT == 1 ]]; then
     else
       warn "skipped -- the daemon cannot start without /dev/uinput access"
     fi
+  fi
+  # Linux's hid driver breaks the original Nimbus's D-pad and analogue
+  # triggers; raw="nimbus" in the profile reads them from its hidraw node,
+  # which needs this controller-scoped rule. Inert without that controller.
+  if [[ ! -f /etc/udev/rules.d/70-$APP-nimbus.rules ]]; then
+    if ask "install the SteelSeries Nimbus (0111:1420) raw-input rule?"; then
+      sudo install -m 644 "$HERE/70-$APP-nimbus.rules" /etc/udev/rules.d/ \
+        && sudo udevadm control --reload-rules \
+        && sudo udevadm trigger --subsystem-match=hidraw --action=change \
+        && sudo udevadm settle \
+        && ok "Nimbus raw-input rule installed (undo: sudo rm /etc/udev/rules.d/70-$APP-nimbus.rules)"
+    fi
+  else
+    ok "Nimbus raw-input rule already installed"
   fi
 fi
 

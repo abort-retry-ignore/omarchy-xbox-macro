@@ -1,0 +1,4 @@
+# Original Bluetooth SteelSeries Nimbus (0111:1420) raw input, for hd2-macro.
+# Tag before 73-seat-late.rules so logind grants access to the active local user.
+# No access is granted to other controllers/keyboards or to all users.
+SUBSYSTEM=="hidraw", KERNELS=="0005:0111:1420.*", TAG+="uaccess"

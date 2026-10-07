@@ -116,7 +116,45 @@ throw_ms       = 120
 # ------------------------------------------------------------------
 [passthrough]
 enabled = true
-match   = []           # [] = first gamepad found; or ["Xbox"] / ["045e:0b12"]
+match   = []           # [] = every gamepad found; or ["Xbox"] / ["045e:0b12"]
+
+# Per-controller profiles: first matching name fragment or vid:pid wins.
+# Without a profile Xbox controllers pass straight through unchanged.
+# invert: virtual controls (LX LY RX RY LT RT DPADX DPADY)
+# remap: real axes (X Y Z RX RY RZ HAT0X HAT0Y) -> virtual controls
+[[passthrough.profile]]
+match  = ["0111:1420"]
+invert = ["LY", "RY"]
+remap  = { Z = "RX", RZ = "RY" }
+# Original SteelSeries Nimbus: read D-pad and analog triggers from its HID
+# reports instead of hid-generic's broken hat/digital trigger translation.
+# Install 70-hd2-macro-nimbus.rules as described in README for hidraw access.
+raw    = "nimbus"
+
+# Strict mapping: unlisted keys are ignored. LT/RT use these as digital
+# fallback only if raw HID access is unavailable. Menu stands in for View/Back
+# (two boxes; B8). The original Nimbus has no separate Start/Guide or stick clicks.
+[passthrough.profile.buttons]
+BTN_A        = "A"
+BTN_B        = "B"
+BTN_C        = "X"
+BTN_NORTH    = "Y"
+BTN_WEST     = "LB"
+BTN_Z        = "RB"
+BTN_TL       = "LT"
+BTN_TR       = "RT"
+KEY_HOMEPAGE = "BACK"
+
+# Hold Menu first, then LB/RB for a left/right stick click, or Y for Xbox
+# Menu/Start (three lines; B9). Y alone still sends ordinary Y.
+# The combination consumes both inputs. Menu alone sends View/Back on release.
+# Works while macros are disarmed. Modifier/input/target names are Xbox buttons
+# AFTER the mapping above; pulse_ms defaults to 80 for the Menu-alone tap.
+[passthrough.profile.chords]
+modifier = "BACK"
+LB = "LS"
+RB = "RS"
+Y = "START"
 
 # ------------------------------------------------------------------
 # Keyboards to watch. Only used when [hotkeys] has keyboard entries.

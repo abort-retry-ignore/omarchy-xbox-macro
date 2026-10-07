@@ -31,6 +31,7 @@ import getpass
 import json
 import os
 import re
+import select
 import selectors
 import shutil
 import socket
@@ -88,6 +89,14 @@ CAPS = {
 }
 TARGET_ABS = dict(CAPS[e.EV_ABS])
 
+# Names usable in [passthrough] invert / remap. Targets are the virtual Xbox
+# pad's controls; remap sources are the real pad's evdev axes (no ABS_ prefix).
+AXIS_TARGETS = {"LX": e.ABS_X, "LY": e.ABS_Y, "RX": e.ABS_RX, "RY": e.ABS_RY,
+                "LT": e.ABS_Z, "RT": e.ABS_RZ,
+                "DPADX": e.ABS_HAT0X, "DPADY": e.ABS_HAT0Y}
+AXIS_SOURCES = {n: getattr(e, "ABS_" + n) for n in
+                ("X", "Y", "Z", "RX", "RY", "RZ", "HAT0X", "HAT0Y")}
+
 
 def js_node_for(evdev_path: str) -> str | None:
     """/dev/input/event26 -> /dev/input/js1 (same underlying input device)."""
@@ -127,7 +136,8 @@ class Pad:
             bustype=p.get("bustype", 3),
         )
         self.lock = threading.RLock()
-        self.phys: dict[tuple[int, int], int] = {}
+        # control -> {source pad path: last value}; see _phys()
+        self.phys: dict[tuple[int, int], dict[str, int]] = {}
         self.macro: dict[tuple[int, int], int] = {}
         self.sent: dict[tuple[int, int], int] = {}
 
@@ -143,7 +153,7 @@ class Pad:
     def _flush(self, keys):
         changed = False
         for k in keys:
-            value = self.macro.get(k, self.phys.get(k, 0))
+            value = self.macro.get(k, self._phys(k))
             if self.sent.get(k, 0) != value:
                 self.sent[k] = value
                 self.ui.write(k[0], k[1], value)
@@ -196,11 +206,40 @@ class Pad:
             self._flush(keys)
 
     # ---- passthrough layer ----------------------------------------------
-    def feed(self, etype: int, code: int, value: int):
+    def _phys(self, k) -> int:
+        """Physical value of a control across every attached pad. The largest
+        deflection wins, so a pad resting at centre never cancels another
+        pad that is in use, and a button stays down while either holds it."""
+        vals = self.phys.get(k)
+        return max(vals.values(), key=abs) if vals else 0
+
+    def feed(self, etype: int, code: int, value: int, src: str = ""):
         with self.lock:
             k = (etype, code)
-            self.phys[k] = value
+            self.phys.setdefault(k, {})[src] = value
             self._flush([k])
+
+    def feed_axes(self, values: dict[int, int], src: str):
+        """Apply one raw report atomically (including diagonal D-pad input)."""
+        with self.lock:
+            keys = []
+            for code, value in values.items():
+                k = (e.EV_ABS, code)
+                self.phys.setdefault(k, {})[src] = value
+                keys.append(k)
+            self._flush(keys)
+
+    def drop(self, src: str):
+        """Forget everything one pad was holding (it disconnected), so its
+        last button/stick state can never stick on the virtual pad."""
+        with self.lock:
+            keys = []
+            for k, vals in list(self.phys.items()):
+                if vals.pop(src, None) is not None:
+                    keys.append(k)
+                if not vals:
+                    del self.phys[k]
+            self._flush(keys)
 
     def close(self):
         try:
@@ -217,9 +256,196 @@ class Pad:
 # passthrough: grab a real controller, merge it into the virtual pad
 # --------------------------------------------------------------------------
 
+class NimbusHID:
+    """Read the original Nimbus's 17-byte Bluetooth HID reports. Its four
+    pressure-sensitive D-pad usages are broken in hid-generic; its analog
+    triggers also become digital EV_KEY events there. Sticks and other
+    buttons still use evdev, with the profile's existing remap/hotkeys.
+
+    A reader thread is independent of the exclusive evdev grab. Pad's lock
+    protects merging with evdev, other controllers, and macro sequences.
+    """
+
+    AXES = (e.ABS_HAT0X, e.ABS_HAT0Y, e.ABS_Z, e.ABS_RZ)
+
+    @staticmethod
+    def node_for(dev) -> str:
+        # Find the hidraw sibling of this exact event node, not an arbitrary
+        # Nimbus: multiple controllers and changing device numbers are safe.
+        sysdev = (Path('/sys/class/input') / Path(dev.path).name / 'device').resolve()
+        for parent in sysdev.parents:
+            if (parent / 'report_descriptor').is_file():
+                nodes = sorted((parent / 'hidraw').glob('hidraw*'))
+                if nodes:
+                    return '/dev/' + nodes[0].name
+                break
+        raise FileNotFoundError(errno.ENOENT, 'Nimbus hidraw node not found', dev.path)
+
+    @staticmethod
+    def decode(report: bytes) -> dict[int, int] | None:
+        # There is no report ID prefix on this model. Reject other lengths
+        # rather than accidentally reading a different report as controls.
+        if len(report) != 17:
+            return None
+        up, right, down, left = report[:4]
+        return {
+            e.ABS_HAT0X: int(right > 0) - int(left > 0),
+            e.ABS_HAT0Y: int(down > 0) - int(up > 0),
+            e.ABS_Z: report[10],
+            e.ABS_RZ: report[11],
+        }
+
+    def __init__(self, dev, pad: Pad, log=print):
+        self.source = dev.path
+        self.pad = pad
+        self.log = log
+        self.node = self.node_for(dev)
+        self.fd = os.open(self.node, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, name='nimbus-hid', daemon=True)
+
+    @property
+    def alive(self) -> bool:
+        return self.thread.is_alive()
+
+    def start(self):
+        # Clear old digital-trigger values when switching to raw input.
+        self.pad.feed_axes(dict.fromkeys(self.AXES, 0), self.source)
+        self.thread.start()
+
+    def _run(self):
+        warned = False
+        try:
+            while not self.stop.is_set():
+                if not select.select([self.fd], [], [], 0.25)[0]:
+                    continue
+                try:
+                    report = os.read(self.fd, 64)
+                except BlockingIOError:
+                    continue
+                if not report:
+                    break
+                values = self.decode(report)
+                if values is not None:
+                    self.pad.feed_axes(values, self.source)
+                elif not warned:
+                    self.log(f'passthrough: {self.node}: ignored unexpected '
+                             f'{len(report)}-byte Nimbus report')
+                    warned = True
+        except OSError as exc:
+            if not self.stop.is_set():
+                self.log(f'passthrough: Nimbus raw input lost: {exc}')
+        finally:
+            self.pad.feed_axes(dict.fromkeys(self.AXES, 0), self.source)
+
+    def close(self):
+        self.stop.set()
+        if self.thread.ident is not None:
+            self.thread.join()
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+class ButtonChords:
+    """Per-controller modifier combinations on already-mapped Xbox buttons.
+
+    The modifier's normal action is deferred until release. If a combination
+    was used, neither modifier nor bumper is sent to the game. A combination
+    target stays held while both inputs are held; a consumed bumper remains
+    suppressed until its own release, even if the modifier releases first.
+    This is physical passthrough, independent of the macro armed state.
+    """
+
+    def __init__(self, pad: Pad, source: str, modifier: int,
+                 bindings: dict[int, int], pulse_ms: float = 80):
+        self.pad = pad
+        self.source = source
+        self.output_source = source + ':chords'
+        self.modifier = modifier
+        self.bindings = bindings
+        self.pulse_ms = pulse_ms
+        self.signature = (modifier, tuple(sorted(bindings.items())), pulse_ms)
+        self.down: set[int] = set()
+        self.active: set[int] = set()
+        self.suppressed: set[int] = set()
+        self.used = False
+        self.deadline: float | None = None
+
+    def _targets(self):
+        held = {self.bindings[b] for b in self.active}
+        for target in set(self.bindings.values()):
+            self.pad.feed(e.EV_KEY, target, int(target in held), self.output_source)
+
+    def _activate(self, button):
+        self.used = True
+        self.active.add(button)
+        self.suppressed.add(button)
+        # If the bumper was already held, release its ordinary output before
+        # substituting a stick click. Hold Menu FIRST to avoid the initial LB/RB.
+        self.pad.feed(e.EV_KEY, button, 0, self.source)
+        self._targets()
+
+    def event(self, code: int, pressed: bool) -> bool:
+        """Return True when this mapped key was consumed by the chord layer."""
+        if code != self.modifier and code not in self.bindings:
+            return False
+        was_down = code in self.down
+        if pressed:
+            self.down.add(code)
+        else:
+            self.down.discard(code)
+
+        if code == self.modifier:
+            if was_down == pressed:
+                return True  # ignore repeats and orphan releases
+            if pressed:
+                self.used = False
+                self.deadline = None
+                self.pad.feed(e.EV_KEY, code, 0, self.output_source)
+                for button in self.bindings:
+                    if button in self.down:
+                        self._activate(button)
+            else:
+                self.active.clear()
+                self._targets()
+                if not self.used:
+                    self.pad.feed(e.EV_KEY, code, 1, self.output_source)
+                    self.deadline = time.monotonic() + self.pulse_ms / 1000.0
+            return True
+
+        consumed = code in self.suppressed or self.modifier in self.down
+        if pressed and not was_down and self.modifier in self.down:
+            self._activate(code)
+        elif not pressed:
+            self.active.discard(code)
+            self.suppressed.discard(code)
+            self._targets()
+        return consumed
+
+    def tick(self, now: float | None = None):
+        now = time.monotonic() if now is None else now
+        if self.deadline is not None and now >= self.deadline:
+            self.pad.feed(e.EV_KEY, self.modifier, 0, self.output_source)
+            self.deadline = None
+
+    def close(self):
+        self.deadline = None
+        self.down.clear()
+        self.active.clear()
+        self.suppressed.clear()
+        self.pad.drop(self.output_source)
+
+
 class Passthrough:
-    """EVIOCGRAB is device-wide in the kernel: while we hold the grab, the
-    source pad's own jsN node emits nothing, so the browser cannot see it."""
+    """Grabs every matching real controller and merges them into the virtual
+    pad. EVIOCGRAB is device-wide in the kernel: while we hold the grab, the
+    source pad's own jsN node emits nothing, so the browser cannot see it.
+
+    Each pad gets its own axis table, built from the first [[passthrough.profile]]
+    whose `match` fits it (name fragment or vid:pid), else from the plain
+    [passthrough] invert/remap keys. So a Nimbus can be flipped and remapped
+    while an Xbox pad passes straight through."""
 
     def __init__(self, pad: Pad, cfg, on_button=None, log=print):
         self.pad = pad
@@ -227,18 +453,41 @@ class Passthrough:
         self.hotkeys: dict[int, str] = {}
         self.on_button = on_button
         self.log = log
-        self.dev: InputDevice | None = None
-        self.scale: dict[int, tuple[float, int, int]] = {}
+        self.devs: dict[str, InputDevice] = {}
+        # path -> {source axis: (target axis, scale, src_min, src_max, tgt_min, invert)}
+        self.scale: dict[str, dict[int, tuple]] = {}
+        self.skip: set[str] = set()   # paths already inspected and not wanted
+        # path -> {source key code: (EV_KEY|EV_ABS, target code)}, or None when
+        # the pad's profile has no `buttons` table (buttons then pass as-is)
+        self.bmap: dict[str, dict | None] = {}
+        self.raw: dict[str, NimbusHID] = {}
+        self.raw_errors: dict[str, str] = {}
+        self.chords: dict[str, ButtonChords] = {}
 
     @property
     def enabled(self) -> bool:
         return bool(self.cfg.get("enabled", True))
 
+    @property
+    def names(self) -> list[str]:
+        return [d.name for d in self.devs.values()]
+
+    @staticmethod
+    def ident(dev) -> str:
+        return f"{dev.info.vendor:04x}:{dev.info.product:04x}"
+
+    def _fits(self, dev, patterns) -> bool:
+        ident = self.ident(dev)
+        return any(str(m).lower() in dev.name.lower() or str(m).lower() == ident
+                   for m in patterns)
+
     def candidates(self) -> list[InputDevice]:
         want = self.cfg.get("match", [])
+        paths = set(list_devices())
+        self.skip &= paths            # forget paths that went away
         out = []
-        for path in list_devices():
-            if path == self.pad.path:
+        for path in sorted(paths):
+            if path == self.pad.path or path in self.devs or path in self.skip:
                 continue
             try:
                 dev = InputDevice(path)
@@ -248,17 +497,18 @@ class Passthrough:
             keys = set(caps.get(e.EV_KEY, []))
             axes = {c for c, _ in caps.get(e.EV_ABS, [])}
             is_pad = e.BTN_A in keys and {e.ABS_X, e.ABS_Y} <= axes
-            ident = f"{dev.info.vendor:04x}:{dev.info.product:04x}"
-            if is_pad and (not want or any(
-                    m.lower() in dev.name.lower() or m.lower() == ident for m in want)):
+            if is_pad and (not want or self._fits(dev, want)):
                 out.append(dev)
             else:
+                self.skip.add(path)
                 dev.close()
         return out
 
-    def attach(self) -> bool:
-        if self.dev or not self.enabled:
-            return False
+    def attach(self) -> list[InputDevice]:
+        """Grab every wanted pad not already held. Returns the new ones."""
+        if not self.enabled:
+            return []
+        new = []
         for dev in self.candidates():
             try:
                 dev.grab()
@@ -266,43 +516,206 @@ class Passthrough:
                 self.log(f"cannot grab {dev.name}: {exc}")
                 dev.close()
                 continue
-            self.dev = dev
-            self.scale = {}
-            for code, ai in dev.capabilities().get(e.EV_ABS, []):
-                tgt = TARGET_ABS.get(code)
-                if not tgt:
-                    continue
-                span = (ai.max - ai.min) or 1
-                self.scale[code] = ((tgt.max - tgt.min) / span, ai.min, tgt.min)
-            self.log(f"passthrough: grabbed {dev.name} "
-                     f"({dev.info.vendor:04x}:{dev.info.product:04x}) -> virtual pad")
-            return True
-        return False
+            self.devs[dev.path] = dev
+            self._build(dev)
+            self.log(f"passthrough: grabbed {dev.name} ({self.ident(dev)}) -> virtual pad")
+            new.append(dev)
+        return new
+
+    def profile_for(self, dev) -> dict:
+        for prof in self.cfg.get("profile", []):
+            if self._fits(dev, prof.get("match", [])):
+                return prof
+        return self.cfg
+
+    def _build(self, dev):
+        """Build one pad's source-axis -> target table from its profile."""
+        prof = self.profile_for(dev)
+        try:
+            remap = {AXIS_SOURCES[str(k).upper()]: AXIS_TARGETS[str(v).upper()]
+                     for k, v in prof.get("remap", {}).items()}
+            invert = {AXIS_TARGETS[str(n).upper()] for n in prof.get("invert", [])}
+        except KeyError as exc:
+            self.log(f"passthrough: unknown axis name {exc} for {dev.name}, "
+                     "ignoring its invert/remap")
+            prof, remap, invert = {}, {}, set()
+        table = {}
+        for code, ai in dev.capabilities().get(e.EV_ABS, []):
+            tcode = remap.get(code, code)
+            tgt = TARGET_ABS.get(tcode)
+            if not tgt:
+                continue
+            if self.wants_raw(dev) and code in (e.ABS_HAT0X, e.ABS_HAT0Y):
+                continue  # hid-generic's Nimbus hat state is not usable
+            span = (ai.max - ai.min) or 1
+            table[code] = (tcode, (tgt.max - tgt.min) / span, ai.min, ai.max,
+                           tgt.min, tcode in invert)
+        self.scale[dev.path] = table
+        self.bmap[dev.path] = self._build_buttons(dev, prof)
+        self._build_chords(dev, prof)
+        if remap or invert:
+            self.log(f"passthrough: {dev.name}: remap={prof.get('remap', {})} "
+                     f"invert={prof.get('invert', [])}")
+
+    def _build_buttons(self, dev, prof) -> dict | None:
+        """profile `buttons`: real key code -> virtual button, or LT / RT,
+        which the virtual pad has as analog axes (a press reads full-scale)."""
+        raw = prof.get("buttons")
+        if raw is None:
+            return None
+        out = {}
+        try:
+            for src, dst in raw.items():
+                d = str(dst).upper()
+                if d in TRIGGERS:
+                    out[padcode(src)] = (e.EV_ABS, TRIGGERS[d])
+                elif d in BUTTONS:
+                    out[padcode(src)] = (e.EV_KEY, BUTTONS[d])
+                else:
+                    raise KeyError(dst)
+        except KeyError as exc:
+            self.log(f"passthrough: unknown button {exc} for {dev.name}, "
+                     "ignoring its buttons table")
+            return None
+        return out
+
+    def _build_chords(self, dev, prof):
+        raw = prof.get('chords')
+        old = self.chords.get(dev.path)
+        signature = None
+        if raw is not None:
+            try:
+                modifier = BUTTONS[str(raw['modifier']).upper()]
+                bindings = {BUTTONS[str(k).upper()]: BUTTONS[str(v).upper()]
+                            for k, v in raw.items() if k not in ('modifier', 'pulse_ms')}
+                pulse_ms = float(raw.get('pulse_ms', 80))
+                if not bindings or not 20 <= pulse_ms <= 1000:
+                    raise ValueError('need bindings and pulse_ms in 20..1000')
+                if (modifier in bindings or modifier in bindings.values()
+                        or set(bindings) & set(bindings.values())):
+                    raise ValueError('modifier, input buttons and targets must not overlap')
+                signature = (modifier, tuple(sorted(bindings.items())), pulse_ms)
+            except (KeyError, ValueError, TypeError, AttributeError) as exc:
+                self.log(f'passthrough: invalid chords for {dev.name}: {exc}; ignoring chords')
+        if old is not None:
+            if old.signature == signature:
+                return  # unrelated config reloads must not forget held combinations
+            old.close()
+            del self.chords[dev.path]
+        if signature is not None:
+            self.chords[dev.path] = ButtonChords(self.pad, dev.path, modifier, bindings, pulse_ms)
+            self.log(f'passthrough: {dev.name}: chords={raw}')
+
+    def tick(self):
+        now = time.monotonic()
+        for chords in self.chords.values():
+            chords.tick(now)
+
+    def timeout(self, maximum: float = 1.0) -> float:
+        """Wake the event loop in time to release a short modifier tap."""
+        now = time.monotonic()
+        deadlines = [c.deadline for c in self.chords.values() if c.deadline is not None]
+        return min(maximum, max(0.0, min(deadlines) - now)) if deadlines else maximum
+
+    def wants_raw(self, dev) -> bool:
+        return (self.enabled and self.ident(dev) == '0111:1420'
+                and self.profile_for(dev).get('raw') == 'nimbus')
+
+    def rescan_raw(self):
+        """Retry unavailable raw nodes without restarting (e.g. after the
+        user installs a uaccess rule). Only the original Nimbus is decoded."""
+        for path, reader in list(self.raw.items()):
+            dev = self.devs.get(path)
+            if not reader.alive or dev is None or not self.wants_raw(dev):
+                reader.close()
+                del self.raw[path]
+        for path, dev in self.devs.items():
+            if path in self.raw or not self.wants_raw(dev):
+                continue
+            try:
+                reader = NimbusHID(dev, self.pad, log=self.log)
+            except OSError as exc:
+                msg = str(exc)
+                if self.raw_errors.get(path) != msg:
+                    self.log(f'passthrough: {dev.name} raw input unavailable: {exc}. '
+                             'D-pad needs hidraw access; triggers remain digital. '
+                             'See README: SteelSeries Nimbus.')
+                    self.raw_errors[path] = msg
+                continue
+            self.raw[path] = reader
+            reader.start()
+            self.raw_errors.pop(path, None)
+            self.log(f'passthrough: {dev.name} raw {reader.node}: '
+                     'D-pad and analog LT/RT active')
+
+    def configure(self):
+        """Rebuild every held pad's table after a config reload."""
+        self.skip.clear()             # match / profile edits may admit new pads
+        for dev in self.devs.values():
+            self._build(dev)
+        self.rescan_raw()
+
+    def release(self, dev):
+        """Let go of one pad and clear whatever it was holding."""
+        if self.devs.pop(dev.path, None) is None:
+            return
+        reader = self.raw.pop(dev.path, None)
+        if reader is not None:
+            reader.close()  # finish raw writes before forgetting this source
+        chords = self.chords.pop(dev.path, None)
+        if chords is not None:
+            chords.close()
+        self.raw_errors.pop(dev.path, None)
+        self.scale.pop(dev.path, None)
+        self.bmap.pop(dev.path, None)
+        self.pad.drop(dev.path)
+        try:
+            dev.ungrab()
+        except Exception:
+            pass
+        try:
+            dev.close()
+        except Exception:
+            pass
+        self.log(f"passthrough: released {dev.name}")
 
     def detach(self):
-        if self.dev:
-            try:
-                self.dev.ungrab()
-            except Exception:
-                pass
-            self.dev.close()
-            self.log(f"passthrough: released {self.dev.name}")
-            self.dev = None
+        for dev in list(self.devs.values()):
+            self.release(dev)
 
     def pump(self, dev):
+        table = self.scale.get(dev.path, {})
+        bmap = self.bmap.get(dev.path)
         try:
             for ev in dev.read():
                 if ev.type == e.EV_KEY:
-                    if ev.code in self.hotkeys:
+                    if bmap is None:                      # no table: identity
+                        kind, code = e.EV_KEY, ev.code
+                        if code not in BUTTONS.values() and code not in self.hotkeys:
+                            continue
+                    else:                                 # explicit table: strict
+                        if ev.code not in bmap:
+                            continue
+                        kind, code = bmap[ev.code]
+                    chords = self.chords.get(dev.path)
+                    if kind == e.EV_KEY and chords is not None and chords.event(code, bool(ev.value)):
+                        continue
+                    if kind == e.EV_KEY and code in self.hotkeys:
                         if ev.value == 1 and self.on_button:
-                            self.on_button(self.hotkeys[ev.code])
+                            self.on_button(self.hotkeys[code])
                         continue  # consumed, never forwarded
-                    if ev.code in BUTTONS.values():
-                        self.pad.feed(e.EV_KEY, ev.code, 1 if ev.value else 0)
-                elif ev.type == e.EV_ABS and ev.code in self.scale:
-                    factor, src_min, tgt_min = self.scale[ev.code]
-                    self.pad.feed(e.EV_ABS, ev.code,
-                                  int(round((ev.value - src_min) * factor + tgt_min)))
+                    if kind == e.EV_ABS:                  # digital press -> analog trigger
+                        reader = self.raw.get(dev.path)
+                        if reader is not None and reader.alive and code in TRIGGERS.values():
+                            continue  # raw pressure owns these; do not overwrite with 255
+                        self.pad.feed(e.EV_ABS, code, 255 if ev.value else 0, dev.path)
+                    else:
+                        self.pad.feed(e.EV_KEY, code, 1 if ev.value else 0, dev.path)
+                elif ev.type == e.EV_ABS and ev.code in table:
+                    tcode, factor, src_min, src_max, tgt_min, inv = table[ev.code]
+                    v = src_min + src_max - ev.value if inv else ev.value
+                    self.pad.feed(e.EV_ABS, tcode,
+                                  int(round((v - src_min) * factor + tgt_min)), dev.path)
         except OSError as exc:
             if exc.errno in (errno.ENODEV, errno.EBADF):
                 return False
@@ -878,8 +1291,10 @@ class Daemon:
                 self.keyboards[dev.path] = dev
                 self.log(f"keyboard: {dev.name}")
             self.resync_mods()
-        if self.through.enabled and not self.through.dev and self.through.attach():
-            self.sel.register(self.through.dev, selectors.EVENT_READ, self._on_pad)
+        if self.through.enabled:
+            for dev in self.through.attach():
+                self.sel.register(dev, selectors.EVENT_READ, self._on_pad)
+        self.through.rescan_raw()
 
     def resync_mods(self):
         """Rebuild modifier state from what is actually held down, so a missed
@@ -930,6 +1345,7 @@ class Daemon:
         self.hotkeys = keys
         self.through.hotkeys = pad
         self.through.cfg = new.get("passthrough", {})
+        self.through.configure()
         self.focus.match = [m.lower() for m in new.get("focus", {}).get("only_when", [])]
         self.notify = Notifier(new, log=self.log)
         self.light.update(new.get("backlight", {}))
@@ -968,13 +1384,9 @@ class Daemon:
 
     def _on_pad(self, dev):
         if not self.through.pump(dev):
-            self.log("passthrough: source disconnected")
+            self.log(f"passthrough: {dev.name} disconnected")
             self.sel.unregister(dev)
-            self.through.dev = None
-            try:
-                dev.close()
-            except Exception:
-                pass
+            self.through.release(dev)
 
     def _on_focus(self, sock):
         if not self.focus.pump(sock):
@@ -1000,13 +1412,14 @@ class Daemon:
         cmd, _, arg = line.partition(" ")
         cmd, arg = cmd.strip().lower(), arg.strip()
         if cmd == "status":
-            src = self.through.dev.name if self.through.dev else "none"
+            src = ", ".join(self.through.names) or "none"
+            raw = ','.join(r.node for r in self.through.raw.values() if r.alive) or 'none'
             gate = (f"focus={'PASS' if self.focus.allowed else 'BLOCKED'}"
                     f"({self.focus.cls or '-'}) " if self.focus.gating else "")
             light = (f" backlight={'held' if self.light.saved else 'auto'}"
                      if self.light.available else "")
             return (f"ok running armed={self.armed} pad={self.pad.path} "
-                    f"js={self.pad.js} passthrough={src} {gate}busy={self.runner.busy}"
+                    f"js={self.pad.js} passthrough={src} raw={raw} {gate}busy={self.runner.busy}"
                     f"{light}")
         if cmd == "arm":
             self.armed = True
@@ -1104,15 +1517,17 @@ class Daemon:
         self.rescan()
         self.log(f"pad {self.pad.path} ({self.pad.js})  "
                  f"hotkeys={len(self.hotkeys) + len(self.through.hotkeys)}")
-        src = self.through.dev.name if self.through.dev else None
+        src = ", ".join(self.through.names)
         self.notify("Macro engine on",
                     f"Virtual pad ready" + (f" \u00b7 {src} merged in" if src else ""),
                     kind="armed")
         last = 0.0
         try:
             while self.running:
-                for key, _ in self.sel.select(timeout=1.0):
+                self.through.tick()
+                for key, _ in self.sel.select(timeout=self.through.timeout()):
                     key.data(key.fileobj)
+                self.through.tick()
                 if time.monotonic() - last > 3:
                     self.maybe_reload()
                     self.rescan()
@@ -1207,7 +1622,11 @@ def gamepads() -> list[dict]:
             "product": read("id/product"),
             "event": f"/dev/input/{ev}" if ev else None,
             "browser_visible": os.access(path, os.R_OK),
-            "virtual": "/devices/virtual/" in os.path.realpath(sysdev),
+            # uinput pads (ours, Steam Input...) live under /devices/virtual/input.
+            # Bluetooth pads are uhid devices under /devices/virtual/misc/uhid but
+            # are real hardware, so they must count as physical.
+            "virtual": ("/devices/virtual/" in os.path.realpath(sysdev)
+                        and "/devices/virtual/misc/uhid/" not in os.path.realpath(sysdev)),
         })
     return out
 
@@ -1315,24 +1734,42 @@ def cmd_revoke(args):
     return 0
 
 
+def _hidden_ids() -> dict[tuple[str, str], None]:
+    """vendor:product pairs already hidden by the installed rule file."""
+    ids: dict[tuple[str, str], None] = {}
+    if UDEV_RULE.exists():
+        for m in re.finditer(r'id/vendor\}=="(\w+)".*?id/product\}=="(\w+)"',
+                             UDEV_RULE.read_text()):
+            ids[(m.group(1), m.group(2))] = None
+    return ids
+
+
 def cmd_hide(args):
+    cfg_pad = (load_config().get("pad", {}) if CONFIG.exists() else {})
+    ours = (f"{cfg_pad.get('vendor', 0x045E):04x}", f"{cfg_pad.get('product', 0x028E):04x}")
     pads = [g for g in gamepads() if not g["virtual"]]
-    if args.all:
-        targets = pads
-    elif args.device:
-        targets = [g for g in pads
-                   if args.device.lower() in g["name"].lower()
-                   or args.device.lower() == f"{g['vendor']}:{g['product']}"]
-    else:
-        targets = pads
+    if args.device and not args.all:
+        pads = [g for g in pads
+                if args.device.lower() in g["name"].lower()
+                or args.device.lower() == f"{g['vendor']}:{g['product']}"]
+    # A real pad sharing the virtual pad's vid:pid would be hidden along with it.
+    clash = [g for g in pads if (g["vendor"], g["product"]) == ours]
+    for g in clash:
+        print(f"  skipping {g['name']} ({g['vendor']}:{g['product']}): same id as the "
+              "virtual pad, hiding it would hide both")
+    targets = [g for g in pads if g not in clash]
     if not targets:
         print("no physical gamepads matched")
         return 1
+    # Merge with what is already hidden, so hiding one pad never un-hides another.
+    ids = _hidden_ids()
+    for g in targets:
+        ids[(g["vendor"], g["product"])] = None
     lines = "\n".join(
-        f'SUBSYSTEM=="input", KERNEL=="js[0-9]*", ATTRS{{id/vendor}}=="{g["vendor"]}", '
-        f'ATTRS{{id/product}}=="{g["product"]}", TAG-="uaccess", '
+        f'SUBSYSTEM=="input", KERNEL=="js[0-9]*", ATTRS{{id/vendor}}=="{v}", '
+        f'ATTRS{{id/product}}=="{pr}", TAG-="uaccess", '
         f'MODE="0600", OWNER="root", GROUP="root"'
-        for g in targets)
+        for v, pr in ids)
     text = RULE.format(app=APP, lines=lines)
     print(f"installing {UDEV_RULE}:\n")
     print(text)

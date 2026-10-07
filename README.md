@@ -90,7 +90,8 @@ hd2-macro doctor
 `grant` and `hide` each need `sudo` once and are reversible with `hd2-macro
 revoke` / `hd2-macro unhide`. Skip `grant` if you only trigger macros from
 `pad:` buttons or Hyprland binds; skip `hide` if you have no physical
-controller. `doctor` tells you which you actually need.
+controller. `doctor` tells you which you actually need. The installer also
+offers the original Nimbus's raw-input rule (see [SteelSeries Nimbus](#steelseries-nimbus)).
 
 ### Other distros
 
@@ -427,6 +428,13 @@ GRABBED   -> joydev saw 0 events
 ungrabbed -> joydev saw 2 events
 ```
 
+Every matching controller is grabbed, including hot-plugged Xbox and Nimbus
+pads. They share one virtual pad: buttons are combined, and the greatest
+stick/trigger deflection wins. An idle pad cannot cancel the pad in use;
+disconnecting a pad clears its held controls. Each controller takes the first
+matching `[[passthrough.profile]]` (name fragment or `vid:pid`); controllers
+without a profile use `[passthrough]` defaults.
+
 You keep playing normally; macros are merged into the same stream. A macro
 overrides a control only while it holds it, then falls back to whatever you're
 physically pressing, so it can never eat a button out from under you.
@@ -440,8 +448,8 @@ readable so hd2-macro can still grab and forward it.
 
 ```bash
 hd2-macro devices     # what the browser can actually see
-hd2-macro hide        # hide every physical pad's js node
-hd2-macro hide Xbox   # or just one, by name fragment or vid:pid
+hd2-macro hide        # hide every connected physical pad's js node, including Bluetooth
+hd2-macro hide Xbox   # or just one, by name fragment or vid:pid; preserves earlier hides
 hd2-macro unhide      # undo
 ```
 
@@ -455,6 +463,73 @@ the browser would see 1 gamepad(s)
 
 If you have no real controller, neither applies — set `passthrough.enabled =
 false` and skip `hide`.
+
+## SteelSeries Nimbus
+
+The **original Bluetooth Nimbus (`0111:1420`)**, not Nimbus+ or Nimbus Cloud,
+needs the per-controller profile in `config.example.toml`. It inverts both
+stick Y axes, moves Z/RZ to the right stick, and maps its unusual HID button
+numbering to Xbox controls. The Menu button serves as **View/Back** (two boxes,
+browser **B8**), rather than Menu/Start (three lines, B9). This model has no
+clickable sticks or separate Start/Guide buttons. The profile emulates stick
+clicks and Menu/Start using controller-button combinations:
+
+| Physical input | Virtual Xbox control |
+|---|---|
+| Press and release Menu alone | View/Back (B8) |
+| Hold Menu, then press/hold LB | Left-stick click / L3 (B10) |
+| Hold Menu, then press/hold RB | Right-stick click / R3 (B11) |
+| Hold Menu, then press/hold Y | Menu/Start — three lines (B9) |
+
+Hold **Menu first**. The emulated button remains held while both inputs are
+held; releasing either releases it. Both bumpers can be combined with Menu
+at once. Neither View/Back nor the ordinary LB/RB/Y action is sent during a
+combination. If Menu releases first, the combined button stays suppressed
+until you release it, so it cannot accidentally fire its ordinary action.
+LB, RB and Y still work normally without Menu.
+
+Menu alone is deferred until **release**, then sent as an 80 ms tap (configurable
+with `pulse_ms` under `[passthrough.profile.chords]`). Pressing LB/RB/Y before
+Menu can already have sent its ordinary press; Menu then substitutes the
+emulated button and releases the ordinary one. These are per-controller **passthrough**
+bindings, not macros, so they work while macros are disarmed. Xbox controllers
+without this profile keep their ordinary buttons and real stick clicks.
+
+Its 17-byte HID report carries pressure-sensitive D-pad directions in bytes
+0–3 (up/right/down/left), eight buttons in bytes 4–11, Menu in byte 12, and
+sticks in bytes 13–16. Linux hid-generic loses the D-pad state and reduces
+triggers to digital key events. `raw = "nimbus"` reads the same controller's
+hidraw node for the D-pad and full **0–255 LT/RT pressure** (bytes 10/11).
+Buttons, sticks and pad hotkeys still use the working evdev mappings. Raw
+D-pad input supports diagonals; opposing directions cancel.
+
+Allow the active local session to read **only this model's** raw device once
+(run from the project directory):
+
+```bash
+sudo install -m 644 70-hd2-macro-nimbus.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=hidraw --action=change
+sudo udevadm settle
+```
+
+The running daemon retries raw access every three seconds, handles reconnects
+and changing hidraw node numbers, and keeps it working while macros are
+**disarmed**. `hd2-macro status` shows `raw=/dev/hidrawN`; the log says
+`D-pad and analog LT/RT active`. Without permission, buttons/sticks still work
+and triggers fall back to digital, but the D-pad remains unavailable. Xbox
+controllers use evdev unchanged and need no new permission.
+
+To remove the raw-device permission, remove
+`/etc/udev/rules.d/70-hd2-macro-nimbus.rules`, repeat the udev commands, and
+restart the daemon (already-open descriptors retain access). To hide the
+silent physical gamepad from Chromium as well, run `hd2-macro hide Nimbus`.
+
+Regression tests need no controllers, root privileges or uinput device:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ## One keypress, one macro
 
